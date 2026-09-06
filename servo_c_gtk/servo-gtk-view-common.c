@@ -27,6 +27,8 @@ enum {
     URI_CHANGED,
     LOAD_CHANGED,
     SCRIPT_DIALOG,
+    SCRIPT_MESSAGE,
+    CONSOLE_MESSAGE,
     SCRIPT_DIALOG_CANCELLED,
     RUN_FILE_CHOOSER,
     AUTHENTICATE,
@@ -50,6 +52,10 @@ static void servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
                                             ServoWebViewHandle *handle,
                                             gint                scale);
 
+/* Registered by attach_servo but defined further down. */
+static void servo_gtk_web_view_on_console_message(guint32     level,
+                                                  const char *message,
+                                                  gpointer    user_data);
 /* Input-method callbacks, registered by attach_servo but defined further down. */
 static void servo_gtk_web_view_on_input_method(bool        multiline,
                                                const char *text,
@@ -766,6 +772,7 @@ servo_gtk_web_view_finalize(GObject *object)
     g_clear_pointer(&self->priv->dialogs, g_hash_table_unref);
     g_clear_pointer(&self->priv->touch_sequences, g_hash_table_unref);
     g_clear_object(&self->priv->im_context);
+    g_clear_pointer(&self->priv->script_message_handlers, g_hash_table_unref);
     g_clear_pointer(&self->priv, g_free);
 
     G_OBJECT_CLASS(servo_gtk_web_view_parent_class)->finalize(object);
@@ -810,6 +817,8 @@ servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
         handle, servo_gtk_web_view_on_create_webview, self);
     servo_webview_set_closed_callback(
         handle, servo_gtk_web_view_on_closed, self);
+    servo_webview_set_console_message_callback(
+        handle, servo_gtk_web_view_on_console_message, self);
     servo_webview_set_input_method_callback(
         handle, servo_gtk_web_view_on_input_method, self);
     servo_webview_set_input_method_hidden_callback(
@@ -873,6 +882,68 @@ servo_gtk_web_view_on_scale_factor_changed(GObject    *object,
 
     servo_gtk_web_view_sync_surface(
         self, SERVO_GTK_WIDGET_WIDTH(widget), SERVO_GTK_WIDGET_HEIGHT(widget));
+}
+
+/* ------------------------------------------------------------------ *
+ * Script messages
+ *
+ * Servo's UserContentManager carries user scripts and stylesheets but has no
+ * message-handler channel of WebKit's kind, and the console is the only push
+ * path from page script back to the embedder. So the bridge below logs a marked
+ * line and this side picks those out again.
+ *
+ * The marker is control characters, which cannot appear in a JSON payload and
+ * are vanishingly unlikely in ordinary console output — but a page can still
+ * log one deliberately, so a script message is untrusted page input, not a
+ * privileged call. Channel names are checked against the registered set, so a
+ * page cannot invent a channel the embedder never asked for.
+ * ------------------------------------------------------------------ */
+
+#define SERVO_GTK_MESSAGE_MARKER "\001servo-gtk-message\001"
+#define SERVO_GTK_MESSAGE_SEPARATOR '\001'
+
+/*
+ * A console message arrived. If it carries the bridge marker and names a
+ * registered channel, report it as a script message; otherwise pass it on as
+ * ordinary console output.
+ */
+static void
+servo_gtk_web_view_on_console_message(guint32     level,
+                                      const char *message,
+                                      gpointer    user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    const gchar     *payload;
+    const gchar     *separator;
+    g_autofree gchar *name = NULL;
+
+    if (message == NULL) {
+        return;
+    }
+
+    if (!g_str_has_prefix(message, SERVO_GTK_MESSAGE_MARKER)) {
+        g_signal_emit(self, signals[CONSOLE_MESSAGE], 0, (guint) level, message);
+        return;
+    }
+
+    payload = message + strlen(SERVO_GTK_MESSAGE_MARKER);
+    separator = strchr(payload, SERVO_GTK_MESSAGE_SEPARATOR);
+    if (separator == NULL) {
+        /* Marked but malformed: treat it as the console output it also is. */
+        g_signal_emit(self, signals[CONSOLE_MESSAGE], 0, (guint) level, message);
+        return;
+    }
+
+    name = g_strndup(payload, separator - payload);
+
+    if (self->priv->script_message_handlers == NULL ||
+        !g_hash_table_contains(self->priv->script_message_handlers, name)) {
+        /* Not a channel the embedder asked for; do not invent one. */
+        g_signal_emit(self, signals[CONSOLE_MESSAGE], 0, (guint) level, message);
+        return;
+    }
+
+    g_signal_emit(self, signals[SCRIPT_MESSAGE], 0, name, separator + 1);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1238,6 +1309,79 @@ servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri)
     }
 
     g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_URI]);
+}
+
+void
+servo_gtk_web_view_load_html(ServoGtkWebView *self,
+                             const gchar     *html,
+                             const gchar     *base_uri)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+    g_return_if_fail(html != NULL);
+
+    /*
+     * Unlike load_uri there is nothing to cache for later: a document only
+     * exists once there is a webview to put it in.
+     */
+    if (self->servo == NULL) {
+        g_warning("servo_gtk_web_view_load_html() before the web view was "
+                  "allocated; the document was dropped");
+        return;
+    }
+
+    servo_webview_load_html(self->servo, html, base_uri);
+}
+
+void
+servo_gtk_web_view_add_user_script(ServoGtkWebView *self, const gchar *source)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+    g_return_if_fail(source != NULL);
+
+    if (self->servo == NULL) {
+        g_warning("servo_gtk_web_view_add_user_script() before the web view was "
+                  "allocated; the script was dropped");
+        return;
+    }
+
+    servo_webview_add_user_script(self->servo, source);
+}
+
+void
+servo_gtk_web_view_register_script_message_handler(ServoGtkWebView *self,
+                                                   const gchar     *name)
+{
+    g_autofree gchar *bridge = NULL;
+
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+    g_return_if_fail(name != NULL && *name != '\0');
+    /* The name goes into a JS string literal and is split on the separator. */
+    g_return_if_fail(strchr(name, '\'') == NULL);
+    g_return_if_fail(strchr(name, SERVO_GTK_MESSAGE_SEPARATOR) == NULL);
+
+    if (self->priv->script_message_handlers == NULL) {
+        self->priv->script_message_handlers =
+            g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    }
+    g_hash_table_add(self->priv->script_message_handlers, g_strdup(name));
+
+    /*
+     * Each channel gets its own postMessage, so page script reads the same as
+     * it would with WebKit's handlers apart from the namespace.
+     */
+    bridge = g_strdup_printf(
+        "(function () {\n"
+        "  window.servoGtk = window.servoGtk || {};\n"
+        "  window.servoGtk.messageHandlers = window.servoGtk.messageHandlers || {};\n"
+        "  window.servoGtk.messageHandlers['%s'] = {\n"
+        "    postMessage: function (value) {\n"
+        "      console.log('%s%s%c' + String(value));\n"
+        "    }\n"
+        "  };\n"
+        "})();\n",
+        name, SERVO_GTK_MESSAGE_MARKER, name, SERVO_GTK_MESSAGE_SEPARATOR);
+
+    servo_gtk_web_view_add_user_script(self, bridge);
 }
 
 const gchar *
@@ -1875,6 +2019,58 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             NULL,       /* default (generic) C marshaller */
             G_TYPE_NONE,
             0
+        );
+
+    /**
+     * ServoGtkWebView::script-message:
+     * @self: the #ServoGtkWebView
+     * @name: the channel the message was posted on
+     * @message: the posted value, as a string
+     *
+     * Emitted when page script calls
+     * `window.servoGtk.messageHandlers.@name.postMessage()` on a channel
+     * registered with servo_gtk_web_view_register_script_message_handler().
+     *
+     * @message is written by the page. The channel rides on the console, which
+     * a page can also write to directly, so treat both @name and @message as
+     * untrusted page input rather than as a privileged call.
+     */
+    signals[SCRIPT_MESSAGE] =
+        g_signal_new(
+            "script-message",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, script_message),
+            NULL, NULL, /* accumulator */
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_NONE,
+            2,
+            G_TYPE_STRING,
+            G_TYPE_STRING
+        );
+
+    /**
+     * ServoGtkWebView::console-message:
+     * @self: the #ServoGtkWebView
+     * @level: a #ServoConsoleLevel value
+     * @message: the logged text
+     *
+     * Emitted when page script logs to the console. Messages carrying the
+     * script-message bridge marker for a registered channel are delivered
+     * through #ServoGtkWebView::script-message instead.
+     */
+    signals[CONSOLE_MESSAGE] =
+        g_signal_new(
+            "console-message",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, console_message),
+            NULL, NULL, /* accumulator */
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_NONE,
+            2,
+            G_TYPE_UINT,
+            G_TYPE_STRING
         );
 }
 

@@ -147,6 +147,12 @@ struct _ServoGtkWebViewClass {
     gboolean (*create_web_view) (ServoGtkWebView *web_view,
                                  guint64          request_id);
     void (*close) (ServoGtkWebView *web_view);
+    void (*script_message) (ServoGtkWebView *web_view,
+                            const gchar     *name,
+                            const gchar     *message);
+    void (*console_message) (ServoGtkWebView *web_view,
+                             guint            level,
+                             const gchar     *message);
 
     /*
      * Padding for future expansion. The original four slots were consumed by
@@ -156,7 +162,6 @@ struct _ServoGtkWebViewClass {
     void (*_gtk_reserved1) (void);
     void (*_gtk_reserved2) (void);
     void (*_gtk_reserved3) (void);
-    void (*_gtk_reserved4) (void);
 };
 
 /**
@@ -176,6 +181,59 @@ ServoGtkWebView *servo_gtk_web_view_new(void);
  * Loads the given URI.
  */
 void servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri);
+
+/**
+ * servo_gtk_web_view_load_html:
+ * @self: a #ServoGtkWebView
+ * @html: the document source
+ * @base_uri: (nullable): the URI the document should behave as if it came from
+ *
+ * Loads @html as a document.
+ *
+ * Servo can only be told to load a URL, so the document is handed over as a
+ * `data:` URL. Its base URL is therefore that `data:` URL rather than
+ * @base_uri, so relative links and subresource references in @html will not
+ * resolve against @base_uri. @base_uri is accepted and currently unused.
+ */
+void servo_gtk_web_view_load_html(ServoGtkWebView *self,
+                                  const gchar     *html,
+                                  const gchar     *base_uri);
+
+/**
+ * servo_gtk_web_view_add_user_script:
+ * @self: a #ServoGtkWebView
+ * @source: the JavaScript source to inject
+ *
+ * Adds a script that runs in every page the web view loads from now on.
+ *
+ * Scripts are applied as a page loads, so one added while a page is already
+ * showing first runs on the next load.
+ */
+void servo_gtk_web_view_add_user_script(ServoGtkWebView *self,
+                                        const gchar     *source);
+
+/**
+ * servo_gtk_web_view_register_script_message_handler:
+ * @self: a #ServoGtkWebView
+ * @name: the channel name to register
+ *
+ * Makes `window.servoGtk.messageHandlers.@name.postMessage(value)` available to
+ * page script; calling it emits #ServoGtkWebView::script-message with @name and
+ * the stringified value.
+ *
+ * The bridge is installed as a user script, so it is only present in pages
+ * loaded *after* this call — register the channel before loading the page that
+ * uses it.
+ *
+ * The channel rides on the console, which is the only push path Servo offers
+ * from page script back to the embedder. Two consequences follow: a page can
+ * forge a message by logging the marker itself, so treat what arrives as
+ * untrusted input from the page rather than as a privileged call; and console
+ * output carrying the marker is delivered as a script message rather than
+ * through #ServoGtkWebView::console-message.
+ */
+void servo_gtk_web_view_register_script_message_handler(ServoGtkWebView *self,
+                                                        const gchar     *name);
 
 /**
  * servo_gtk_web_view_get_uri:

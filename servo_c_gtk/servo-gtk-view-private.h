@@ -98,6 +98,12 @@ struct _ServoGtkWebViewPrivate {
      */
     GtkIMContext *im_context;
     /*
+     * Script-message channels the embedder has registered, as a set of names.
+     * A console message carrying the bridge marker is only turned into a script
+     * message when its channel is in here, so a page cannot invent channels.
+     */
+    GHashTable   *script_message_handlers;
+    /*
      * Whether a composition is open. Only a commit that arrives during one is
      * forwarded as text: outside a composition the key event already carries
      * the character, and sending both would insert it twice.
