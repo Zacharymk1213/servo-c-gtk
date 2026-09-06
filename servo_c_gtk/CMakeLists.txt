@@ -205,6 +205,10 @@ function(add_servo_gtk_library)
             ${ARG_HEADERS}
     )
 
+    # Selects which public header and which compatibility macros the shared
+    # sources compile against (see servo-gtk-view-private.h).
+    target_compile_definitions(${lib} PRIVATE SERVO_GTK_MAJOR=${ARG_MAJOR})
+
     target_include_directories(${lib}
             PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}
@@ -251,6 +255,8 @@ function(add_servo_gtk_library)
                 servo-webview-scan-stub.c
                 ${ARG_HEADERS}
         )
+
+        target_compile_definitions(${lib}-scan PRIVATE SERVO_GTK_MAJOR=${ARG_MAJOR})
 
         target_include_directories(${lib}-scan
                 PRIVATE
@@ -420,7 +426,7 @@ add_servo_gtk_library(
         GTK_PREFIX  GTK3
         GTK_PKG     gtk+-3.0
         GIR_INCLUDE Gtk-3.0
-        SOURCES     servo-gtk3-view.c
+        SOURCES     servo-gtk3-view.c servo-gtk-view-common.c
         HEADERS     servo-gtk3-view.h
 )
 
@@ -430,7 +436,7 @@ add_servo_gtk_library(
         GTK_PREFIX  GTK4
         GTK_PKG     gtk4
         GIR_INCLUDE Gtk-4.0
-        SOURCES     servo-gtk4-view.c
+        SOURCES     servo-gtk4-view.c servo-gtk-view-common.c
         HEADERS     servo-gtk4-view.h
 )
 
