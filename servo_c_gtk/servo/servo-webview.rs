@@ -31,8 +31,8 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    AuthenticationRequest, EmbedderControl, EmbedderControlId, FilePicker, Key, KeyState,
-    KeyboardEvent, LoadStatus, Location,
+    AuthenticationRequest, ContextMenu, ContextMenuAction, ContextMenuItem, EmbedderControl,
+    EmbedderControlId, FilePicker, Key, KeyState, KeyboardEvent, LoadStatus, Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
     PermissionFeature, PermissionRequest, PrefValue, Preferences, RenderingContext, Scroll,
     Servo, ServoBuilder, SimpleDialog,
@@ -106,6 +106,74 @@ pub type ServoFilePickerCallback = extern "C" fn(
     filter_patterns: *const *const c_char,
     filter_pattern_count: usize,
     allow_multiple: bool,
+    user_data: *mut c_void,
+);
+
+/// Actions a context-menu item can carry. Mirrors the
+/// `SERVO_CONTEXT_MENU_ACTION_*` constants in `servo-webview.h` — keep the two
+/// in sync.
+mod servo_context_menu_action {
+    pub const GO_BACK: u32 = 0;
+    pub const GO_FORWARD: u32 = 1;
+    pub const RELOAD: u32 = 2;
+    pub const COPY_LINK: u32 = 3;
+    pub const OPEN_LINK_IN_NEW_WEBVIEW: u32 = 4;
+    pub const COPY_IMAGE_LINK: u32 = 5;
+    pub const OPEN_IMAGE_IN_NEW_VIEW: u32 = 6;
+    pub const CUT: u32 = 7;
+    pub const COPY: u32 = 8;
+    pub const PASTE: u32 = 9;
+    pub const SELECT_ALL: u32 = 10;
+}
+
+/// Map a Servo [`ContextMenuAction`] to its ABI value. The match is exhaustive
+/// on purpose: an action added to a later Servo breaks this build rather than
+/// silently arriving at the host as a different one.
+fn context_menu_action_to_abi(action: ContextMenuAction) -> u32 {
+    match action {
+        ContextMenuAction::GoBack => servo_context_menu_action::GO_BACK,
+        ContextMenuAction::GoForward => servo_context_menu_action::GO_FORWARD,
+        ContextMenuAction::Reload => servo_context_menu_action::RELOAD,
+        ContextMenuAction::CopyLink => servo_context_menu_action::COPY_LINK,
+        ContextMenuAction::OpenLinkInNewWebView => {
+            servo_context_menu_action::OPEN_LINK_IN_NEW_WEBVIEW
+        },
+        ContextMenuAction::CopyImageLink => servo_context_menu_action::COPY_IMAGE_LINK,
+        ContextMenuAction::OpenImageInNewView => {
+            servo_context_menu_action::OPEN_IMAGE_IN_NEW_VIEW
+        },
+        ContextMenuAction::Cut => servo_context_menu_action::CUT,
+        ContextMenuAction::Copy => servo_context_menu_action::COPY,
+        ContextMenuAction::Paste => servo_context_menu_action::PASTE,
+        ContextMenuAction::SelectAll => servo_context_menu_action::SELECT_ALL,
+    }
+}
+
+/// One entry of a context menu, as handed to a [`ServoContextMenuCallback`].
+/// Mirrors `ServoContextMenuItem` in `servo-webview.h`.
+#[repr(C)]
+pub struct ServoContextMenuItem {
+    /// The item's text, or NULL when this entry is a separator.
+    pub label: *const c_char,
+    /// A `SERVO_CONTEXT_MENU_ACTION_*` value; meaningless for a separator.
+    pub action: u32,
+    /// Whether the item can be chosen.
+    pub enabled: bool,
+}
+
+/// Called when the user asks for a context menu on web content.
+///
+/// The menu is *not* answered when this returns: the host shows its own menu
+/// and later calls [`servo_webview_context_menu_respond`] with `request_id` and
+/// the index of the chosen item. `items` holds `item_count` entries valid only
+/// for the duration of the call. `x` and `y` are the top-left of the element the
+/// menu was opened on, in device pixels.
+pub type ServoContextMenuCallback = extern "C" fn(
+    request_id: u64,
+    items: *const ServoContextMenuItem,
+    item_count: usize,
+    x: i32,
+    y: i32,
     user_data: *mut c_void,
 );
 
@@ -196,6 +264,7 @@ enum PendingRequest {
     FilePicker(FilePicker),
     Authentication(AuthenticationRequest),
     Permission(PermissionRequest),
+    ContextMenu(ContextMenu),
 }
 
 /// A [`PendingRequest`] plus the engine-side id it arrived with, which is what
@@ -312,6 +381,11 @@ struct PermissionCallback {
     user_data: *mut c_void,
 }
 
+struct ContextMenuCallback {
+    func: ServoContextMenuCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -326,6 +400,7 @@ struct EmbedderDelegate {
     file_picker_callback: RefCell<Option<FilePickerCallback>>,
     authentication_callback: RefCell<Option<AuthenticationCallback>>,
     permission_callback: RefCell<Option<PermissionCallback>>,
+    context_menu_callback: RefCell<Option<ContextMenuCallback>>,
     request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
     requests: RequestRegistry,
 }
@@ -344,6 +419,7 @@ impl EmbedderDelegate {
             file_picker_callback: RefCell::new(None),
             authentication_callback: RefCell::new(None),
             permission_callback: RefCell::new(None),
+            context_menu_callback: RefCell::new(None),
             request_cancelled_callback: RefCell::new(None),
             requests: RequestRegistry::default(),
         }
@@ -445,6 +521,7 @@ impl WebViewDelegate for EmbedderDelegate {
         match embedder_control {
             EmbedderControl::SimpleDialog(dialog) => self.show_simple_dialog(control_id, dialog),
             EmbedderControl::FilePicker(picker) => self.show_file_picker(control_id, picker),
+            EmbedderControl::ContextMenu(menu) => self.show_context_menu(control_id, menu),
             // Select-element pickers, colour pickers and IME are not wired up
             // yet. Dropping the control answers it with its default (dismissed
             // / no selection) rather than leaving script waiting.
@@ -600,6 +677,63 @@ impl EmbedderDelegate {
             allow_multiple,
             user_data,
         );
+    }
+
+    /// Hand a context menu to the host and keep it alive until the host answers.
+    /// With no callback registered the menu is dropped here, which dismisses it.
+    fn show_context_menu(&self, control_id: EmbedderControlId, menu: ContextMenu) {
+        let cb = self
+            .context_menu_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        // Keep the labels alive for the duration of the call; the item array
+        // only borrows their pointers.
+        let labels: Vec<Option<CString>> = menu
+            .items()
+            .iter()
+            .map(|item| match item {
+                // A label with an interior NUL becomes empty rather than None:
+                // None is what marks a separator in the array below.
+                ContextMenuItem::Item { label, .. } => {
+                    Some(CString::new(label.as_str()).unwrap_or_default())
+                },
+                ContextMenuItem::Separator => None,
+            })
+            .collect();
+
+        let items: Vec<ServoContextMenuItem> = menu
+            .items()
+            .iter()
+            .zip(labels.iter())
+            .map(|(item, label)| match item {
+                ContextMenuItem::Item {
+                    action, enabled, ..
+                } => ServoContextMenuItem {
+                    label: label.as_ref().map_or(ptr::null(), |label| label.as_ptr()),
+                    action: context_menu_action_to_abi(*action),
+                    enabled: *enabled,
+                },
+                ContextMenuItem::Separator => ServoContextMenuItem {
+                    label: ptr::null(),
+                    action: 0,
+                    enabled: false,
+                },
+            })
+            .collect();
+
+        let position = menu.position();
+        let (x, y) = (position.min.x, position.min.y);
+
+        let id = self
+            .requests
+            .insert(Some(control_id), PendingRequest::ContextMenu(menu));
+
+        func(id, items.as_ptr(), items.len(), x, y, user_data);
     }
 }
 
@@ -1053,6 +1187,64 @@ pub unsafe extern "C" fn servo_webview_set_permission_callback(
     };
     *handle.delegate.permission_callback.borrow_mut() =
         callback.map(|func| PermissionCallback { func, user_data });
+}
+
+/// Register the context-menu callback, invoked when the user asks for a context
+/// menu on web content. Pass a NULL `callback` to clear it.
+///
+/// With no callback registered the menu is dismissed immediately.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_context_menu_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoContextMenuCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.context_menu_callback.borrow_mut() =
+        callback.map(|func| ContextMenuCallback { func, user_data });
+}
+
+/// Answer a context menu reported through a [`ServoContextMenuCallback`].
+///
+/// `item_index` is an index into the `items` array that came with the menu.
+/// `SERVO_CONTEXT_MENU_NO_SELECTION` — or any out-of-range index, or the index
+/// of a separator — dismisses the menu with no selection.
+///
+/// An unknown `request_id` is ignored.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_context_menu_respond(
+    webview: *mut ServoWebViewHandle,
+    request_id: u64,
+    item_index: usize,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    let Some(PendingRequest::ContextMenu(menu)) = handle.delegate.requests.take(request_id)
+    else {
+        return;
+    };
+
+    // Re-read the action from the menu rather than trusting an action value
+    // sent back across the boundary, so a bad index can only ever dismiss.
+    let action = match menu.items().get(item_index) {
+        Some(ContextMenuItem::Item { action, .. }) => *action,
+        _ => {
+            menu.dismiss();
+            return;
+        },
+    };
+
+    menu.select(action);
 }
 
 /// Answer an authentication challenge reported through a

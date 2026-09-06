@@ -25,6 +25,7 @@ enum {
     RUN_FILE_CHOOSER,
     AUTHENTICATE,
     PERMISSION_REQUEST,
+    CONTEXT_MENU,
     N_SIGNALS
 };
 
@@ -51,6 +52,14 @@ struct _ServoGtkWebViewPrivate {
      * window removes itself from here when it is destroyed.
      */
     GHashTable *dialogs;
+    /*
+     * The items of the context menu whose ::context-menu emission is in flight.
+     * The emission is synchronous and the array belongs to the FFI callback for
+     * exactly its duration, so only the class closure reads this, and only from
+     * inside that emission.
+     */
+    const ServoContextMenuItem *menu_items;
+    gsize                       menu_item_count;
 };
 
 /*
@@ -848,6 +857,168 @@ servo_gtk_web_view_default_permission_request(ServoGtkWebView           *self,
     return TRUE;
 }
 
+/* ------------------------------------------------------------------ *
+ * Built-in context menu
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    ServoGtkWebView *web_view;    /* holds a reference */
+    guint64          request_id;
+    gboolean         responded;
+} ContextMenuClosure;
+
+static void
+context_menu_closure_free(gpointer data)
+{
+    ContextMenuClosure *closure = data;
+
+    g_object_unref(closure->web_view);
+    g_free(closure);
+}
+
+/* Answer the menu this GtkMenu is showing, at most once. */
+static void
+context_menu_respond(GtkWidget *menu, gsize item_index)
+{
+    ContextMenuClosure *closure =
+        g_object_get_data(G_OBJECT(menu), "servo-gtk-context-menu");
+
+    if (closure == NULL || closure->responded) {
+        return;
+    }
+    closure->responded = TRUE;
+
+    servo_gtk_web_view_respond_to_context_menu(
+        closure->web_view, closure->request_id, item_index);
+}
+
+static void
+on_context_menu_item_activate(GtkMenuItem *item, gpointer user_data)
+{
+    GtkWidget *menu = user_data;
+    gsize      index =
+        GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(item), "servo-gtk-item-index"));
+
+    context_menu_respond(menu, index);
+}
+
+static void
+on_context_menu_selection_done(GtkMenuShell *menu, gpointer user_data)
+{
+    (void) user_data;
+
+    /* Closing without a choice dismisses; choosing already answered. */
+    context_menu_respond(GTK_WIDGET(menu), SERVO_GTK_CONTEXT_MENU_NO_SELECTION);
+
+    gtk_widget_destroy(GTK_WIDGET(menu));
+}
+
+/* Class closure for ::context-menu: present the menu ourselves. */
+static gboolean
+servo_gtk_web_view_default_context_menu(ServoGtkWebView    *self,
+                                        gint                x,
+                                        gint                y,
+                                        const gchar *const *labels,
+                                        guint64             request_id)
+{
+    const ServoContextMenuItem *items = self->priv->menu_items;
+    gsize                       item_count = self->priv->menu_item_count;
+    ContextMenuClosure         *closure;
+    GtkWidget                  *menu;
+    GdkRectangle                anchor = { x, y, 1, 1 };
+    GdkWindow                  *window;
+
+    (void) labels;
+
+    if (items == NULL || item_count == 0) {
+        /* Nothing to show; dismissing keeps the page from waiting on us. */
+        servo_gtk_web_view_respond_to_context_menu(
+            self, request_id, SERVO_GTK_CONTEXT_MENU_NO_SELECTION);
+        return TRUE;
+    }
+
+    menu = gtk_menu_new();
+
+    for (gsize i = 0; i < item_count; i++) {
+        GtkWidget *item;
+
+        if (items[i].label == NULL) {
+            item = gtk_separator_menu_item_new();
+        } else {
+            item = gtk_menu_item_new_with_label(items[i].label);
+            gtk_widget_set_sensitive(item, items[i].enabled);
+            g_object_set_data(G_OBJECT(item), "servo-gtk-item-index", GSIZE_TO_POINTER(i));
+            g_signal_connect(item, "activate",
+                             G_CALLBACK(on_context_menu_item_activate), menu);
+        }
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+
+    closure = g_new0(ContextMenuClosure, 1);
+    closure->web_view = g_object_ref(self);
+    closure->request_id = request_id;
+    g_object_set_data_full(G_OBJECT(menu), "servo-gtk-context-menu",
+                           closure, context_menu_closure_free);
+
+    gtk_menu_attach_to_widget(GTK_MENU(menu), GTK_WIDGET(self), NULL);
+    g_signal_connect(menu, "selection-done",
+                     G_CALLBACK(on_context_menu_selection_done), NULL);
+    gtk_widget_show_all(menu);
+
+    window = gtk_widget_get_window(GTK_WIDGET(self));
+    if (window != NULL) {
+        gtk_menu_popup_at_rect(GTK_MENU(menu), window, &anchor,
+                               GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST, NULL);
+    } else {
+        gtk_menu_popup_at_widget(GTK_MENU(menu), GTK_WIDGET(self),
+                                 GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST, NULL);
+    }
+
+    return TRUE;
+}
+
+/*
+ * The user asked for a context menu. Only reports it; the chosen item travels
+ * back later through servo_gtk_web_view_respond_to_context_menu().
+ *
+ * The signal carries the labels so a handler can present its own menu, while
+ * the built-in one needs the enabled flags and separators too — those are
+ * stashed for the duration of this synchronous emission rather than being
+ * flattened into the signal's arguments.
+ */
+static void
+servo_gtk_web_view_on_context_menu(guint64                     request_id,
+                                   const ServoContextMenuItem *items,
+                                   gsize                       item_count,
+                                   gint32                      x,
+                                   gint32                      y,
+                                   gpointer                    user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gboolean         handled = FALSE;
+    GPtrArray       *labels = g_ptr_array_new();
+    gint             scale = MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(self)));
+
+    for (gsize i = 0; i < item_count; i++) {
+        /* A separator has no label; report it as empty so indices still line up. */
+        g_ptr_array_add(labels,
+                        (gpointer) (items[i].label != NULL ? items[i].label : ""));
+    }
+    g_ptr_array_add(labels, NULL);
+
+    self->priv->menu_items = items;
+    self->priv->menu_item_count = item_count;
+
+    /* Servo positions in device pixels; GTK widget coordinates are logical. */
+    g_signal_emit(self, signals[CONTEXT_MENU], 0,
+                  x / scale, y / scale, labels->pdata, request_id, &handled);
+
+    self->priv->menu_items = NULL;
+    self->priv->menu_item_count = 0;
+
+    g_ptr_array_free(labels, TRUE);
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -1060,6 +1231,8 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
                 self->servo, servo_gtk_web_view_on_authentication, self);
             servo_webview_set_permission_callback(
                 self->servo, servo_gtk_web_view_on_permission, self);
+            servo_webview_set_context_menu_callback(
+                self->servo, servo_gtk_web_view_on_context_menu, self);
             servo_webview_set_request_cancelled_callback(
                 self->servo, servo_gtk_web_view_on_request_cancelled, self);
         }
@@ -1326,6 +1499,7 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
     klass->run_file_chooser = servo_gtk_web_view_default_run_file_chooser;
     klass->authenticate = servo_gtk_web_view_default_authenticate;
     klass->permission_request = servo_gtk_web_view_default_permission_request;
+    klass->context_menu = servo_gtk_web_view_default_context_menu;
 
     widget_class->draw = servo_gtk_web_view_draw;
     widget_class->size_allocate = servo_gtk_web_view_size_allocate;
@@ -1590,6 +1764,42 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             SERVO_GTK_TYPE_PERMISSION_FEATURE,
             G_TYPE_UINT64
         );
+
+    /**
+     * ServoGtkWebView::context-menu:
+     * @self: the #ServoGtkWebView
+     * @x: the x coordinate to open the menu at, in widget coordinates
+     * @y: the y coordinate to open the menu at, in widget coordinates
+     * @labels: (array zero-terminated=1): the item labels, in order; a
+     *   separator appears as an empty string so that indices line up
+     * @request_id: identifies this menu when answering it
+     *
+     * Emitted when the user asks for a context menu on web content. The default
+     * handler presents the menu and answers it.
+     *
+     * Return %TRUE from a handler to present your own menu; you must then call
+     * servo_gtk_web_view_respond_to_context_menu() with @request_id and the
+     * index of the chosen item, or %SERVO_GTK_CONTEXT_MENU_NO_SELECTION to
+     * dismiss. Items of your own that Servo knows nothing about are yours to
+     * act on; dismiss Servo's menu in that case.
+     *
+     * Returns: %TRUE to stop the built-in menu from being shown
+     */
+    signals[CONTEXT_MENU] =
+        g_signal_new(
+            "context-menu",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, context_menu),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            4,
+            G_TYPE_INT,
+            G_TYPE_INT,
+            G_TYPE_STRV,
+            G_TYPE_UINT64
+        );
 }
 
 static void
@@ -1777,6 +1987,18 @@ servo_gtk_web_view_respond_to_permission_request(ServoGtkWebView *self,
 
     if (self->servo != NULL) {
         servo_webview_permission_respond(self->servo, request_id, allowed);
+    }
+}
+
+void
+servo_gtk_web_view_respond_to_context_menu(ServoGtkWebView *self,
+                                           guint64          request_id,
+                                           gsize            item_index)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo != NULL) {
+        servo_webview_context_menu_respond(self->servo, request_id, item_index);
     }
 }
 

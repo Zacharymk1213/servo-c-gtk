@@ -151,6 +151,22 @@ servo_webview_permission_respond(ServoWebViewHandle *webview,
     (void) webview; (void) request_id; (void) allowed;
 }
 
+void
+servo_webview_set_context_menu_callback(ServoWebViewHandle      *webview,
+                                        ServoContextMenuCallback callback,
+                                        void                    *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_context_menu_respond(ServoWebViewHandle *webview,
+                                   uint64_t            request_id,
+                                   size_t              item_index)
+{
+    (void) webview; (void) request_id; (void) item_index;
+}
+
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 {
     (void) webview; (void) uri;

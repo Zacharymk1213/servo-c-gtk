@@ -118,6 +118,51 @@ typedef void (*ServoFilePickerCallback)(uint64_t           request_id,
                                         bool               allow_multiple,
                                         void              *user_data);
 
+/* What a context-menu item does when chosen. */
+typedef enum {
+    SERVO_CONTEXT_MENU_ACTION_GO_BACK = 0,
+    SERVO_CONTEXT_MENU_ACTION_GO_FORWARD = 1,
+    SERVO_CONTEXT_MENU_ACTION_RELOAD = 2,
+    SERVO_CONTEXT_MENU_ACTION_COPY_LINK = 3,
+    SERVO_CONTEXT_MENU_ACTION_OPEN_LINK_IN_NEW_WEBVIEW = 4,
+    SERVO_CONTEXT_MENU_ACTION_COPY_IMAGE_LINK = 5,
+    SERVO_CONTEXT_MENU_ACTION_OPEN_IMAGE_IN_NEW_VIEW = 6,
+    SERVO_CONTEXT_MENU_ACTION_CUT = 7,
+    SERVO_CONTEXT_MENU_ACTION_COPY = 8,
+    SERVO_CONTEXT_MENU_ACTION_PASTE = 9,
+    SERVO_CONTEXT_MENU_ACTION_SELECT_ALL = 10
+} ServoContextMenuAction;
+
+/* One entry of a context menu. */
+typedef struct {
+    /* The item's text, or NULL when this entry is a separator. */
+    const char *label;
+    /* A ServoContextMenuAction; meaningless for a separator. */
+    uint32_t    action;
+    /* Whether the item can be chosen. */
+    bool        enabled;
+} ServoContextMenuItem;
+
+/* Passed to servo_webview_context_menu_respond() to dismiss with no selection. */
+#define SERVO_CONTEXT_MENU_NO_SELECTION ((size_t) -1)
+
+/*
+ * Invoked when the user asks for a context menu on web content. The menu is NOT
+ * answered when this returns: show your own menu and call
+ * servo_webview_context_menu_respond() with `request_id` and the index of the
+ * chosen item.
+ *
+ * `items` holds `item_count` entries valid only for the duration of the call.
+ * `x` and `y` are the top-left of the element the menu was opened on, in device
+ * pixels.
+ */
+typedef void (*ServoContextMenuCallback)(uint64_t                    request_id,
+                                         const ServoContextMenuItem *items,
+                                         size_t                      item_count,
+                                         int32_t                     x,
+                                         int32_t                     y,
+                                         void                       *user_data);
+
 /*
  * Invoked when a server or proxy issues an HTTP authentication challenge. The
  * request is NOT answered when this returns: prompt for credentials and call
@@ -265,6 +310,21 @@ void servo_webview_authentication_respond(ServoWebViewHandle *webview,
 void servo_webview_permission_respond(ServoWebViewHandle *webview,
                                       uint64_t            request_id,
                                       bool                allowed);
+
+void servo_webview_set_context_menu_callback(ServoWebViewHandle      *webview,
+                                             ServoContextMenuCallback callback,
+                                             void                    *user_data);
+
+/*
+ * Answer a context menu reported through a ServoContextMenuCallback.
+ * `item_index` indexes the `items` array that came with the menu;
+ * SERVO_CONTEXT_MENU_NO_SELECTION, an out-of-range index, or the index of a
+ * separator all dismiss the menu with no selection. An unknown `request_id` is
+ * ignored.
+ */
+void servo_webview_context_menu_respond(ServoWebViewHandle *webview,
+                                        uint64_t            request_id,
+                                        size_t              item_index);
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);

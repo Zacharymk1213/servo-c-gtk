@@ -139,6 +139,11 @@ struct _ServoGtkWebViewClass {
     gboolean (*permission_request) (ServoGtkWebView           *web_view,
                                     ServoGtkPermissionFeature  feature,
                                     guint64                    request_id);
+    gboolean (*context_menu) (ServoGtkWebView    *web_view,
+                              gint                x,
+                              gint                y,
+                              const gchar *const *labels,
+                              guint64             request_id);
 
     /*
      * Padding for future expansion. The original four slots were consumed by
@@ -319,6 +324,31 @@ void servo_gtk_web_view_respond_to_authentication(ServoGtkWebView *self,
 void servo_gtk_web_view_respond_to_permission_request(ServoGtkWebView *self,
                                                       guint64          request_id,
                                                       gboolean         allowed);
+
+/**
+ * SERVO_GTK_CONTEXT_MENU_NO_SELECTION:
+ *
+ * Passed to servo_gtk_web_view_respond_to_context_menu() to dismiss a context
+ * menu without choosing anything.
+ */
+#define SERVO_GTK_CONTEXT_MENU_NO_SELECTION ((gsize) -1)
+
+/**
+ * servo_gtk_web_view_respond_to_context_menu:
+ * @self: a #ServoGtkWebView
+ * @request_id: the id from the #ServoGtkWebView::context-menu emission
+ * @item_index: the index of the chosen item, or
+ *   %SERVO_GTK_CONTEXT_MENU_NO_SELECTION to dismiss
+ *
+ * Answers a context menu reported by #ServoGtkWebView::context-menu. An
+ * out-of-range index, or the index of a separator, dismisses the menu.
+ *
+ * Only needed by a handler that returned %TRUE to present its own menu — the
+ * built-in one answers on its own.
+ */
+void servo_gtk_web_view_respond_to_context_menu(ServoGtkWebView *self,
+                                                guint64          request_id,
+                                                gsize            item_index);
 
 /**
  * servo_gtk_web_view_reload:
