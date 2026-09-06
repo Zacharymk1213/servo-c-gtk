@@ -23,6 +23,12 @@ else()
     option(BUILD_GIR "Build GObject-introspection GIR/typelib" ON)
 endif()
 
+option(BUILD_TESTING "Build the unit tests" ON)
+
+if(BUILD_TESTING)
+    enable_testing()
+endif()
+
 # Both the GTK3 and GTK4 variants of the library are built together, each
 # against its own GTK. The two libraries share the same public API and the same
 # Rust runtime (libservoshell); only the GTK internals differ.
@@ -348,6 +354,35 @@ function(add_servo_gtk_library)
                 DESTINATION ${CMAKE_INSTALL_LIBDIR}/girepository-1.0
                 OPTIONAL
         )
+    endif()
+
+    # --- Tests --------------------------------------------------------------
+    # Linked against the same C sources plus the no-op FFI stubs as the
+    # introspection twin, for the same reason: the widget's GObject surface and
+    # its behaviour before a Servo webview exists do not involve the engine, and
+    # linking libservoshell would make the tests need a working Servo build to
+    # say anything at all.
+    if(BUILD_TESTING)
+        add_executable(${lib}-test
+                ${ARG_SOURCES}
+                servo-webview-scan-stub.c
+                tests/test-servo-gtk-view.c)
+
+        target_include_directories(${lib}-test
+                PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}
+                ${CMAKE_CURRENT_SOURCE_DIR}/servo
+                ${gtk_include_dirs})
+
+        target_compile_definitions(${lib}-test PRIVATE SERVO_GTK_MAJOR=${ARG_MAJOR})
+        target_compile_options(${lib}-test PRIVATE ${gtk_cflags_other})
+        target_link_libraries(${lib}-test PRIVATE ${gtk_libraries})
+
+        add_test(NAME ${lib}-test COMMAND ${lib}-test --tap)
+
+        # Constructing a widget needs a display; the test reports 77 when there
+        # is none so a headless run skips rather than fails.
+        set_tests_properties(${lib}-test PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # --- Demo ---------------------------------------------------------------
