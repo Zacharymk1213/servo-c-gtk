@@ -22,6 +22,7 @@ enum {
     LOAD_CHANGED,
     SCRIPT_DIALOG,
     SCRIPT_DIALOG_CANCELLED,
+    RUN_FILE_CHOOSER,
     N_SIGNALS
 };
 
@@ -464,6 +465,148 @@ servo_gtk_web_view_on_request_cancelled(guint64 request_id, gpointer user_data)
     g_signal_emit(self, signals[SCRIPT_DIALOG_CANCELLED], 0, request_id);
 }
 
+/* ------------------------------------------------------------------ *
+ * Built-in file chooser
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    ServoGtkWebView *web_view;    /* holds a reference */
+    guint64          request_id;
+} FileChooserClosure;
+
+/* Matches GClosureNotify; released when the response handler goes away. */
+static void
+file_chooser_closure_free(gpointer data, GClosure *unused)
+{
+    FileChooserClosure *closure = data;
+
+    (void) unused;
+
+    g_object_unref(closure->web_view);
+    g_free(closure);
+}
+
+/* Build a GtkFileFilter from Servo's bare extensions, or NULL for "any file". */
+static GtkFileFilter *
+servo_gtk_web_view_build_file_filter(const gchar *const *filter_patterns)
+{
+    GtkFileFilter *filter;
+
+    if (filter_patterns == NULL || filter_patterns[0] == NULL) {
+        return NULL;
+    }
+
+    filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "Accepted files");
+
+    for (gsize i = 0; filter_patterns[i] != NULL; i++) {
+        /* Servo reports extensions without the dot; GTK wants a glob. */
+        gchar *glob = g_strconcat("*.", filter_patterns[i], NULL);
+        gtk_file_filter_add_pattern(filter, glob);
+        g_free(glob);
+    }
+
+    return filter;
+}
+
+/*
+ * The native chooser closed. Turn the selection into the NULL-terminated path
+ * array the widget answers with; anything but "accept" answers empty.
+ */
+static void
+on_file_chooser_response(GtkNativeDialog *native, gint response_id, gpointer user_data)
+{
+    FileChooserClosure *closure = user_data;
+    GPtrArray          *paths = g_ptr_array_new_with_free_func(g_free);
+
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        GSList *files = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(native));
+
+        for (GSList *item = files; item != NULL; item = item->next) {
+            g_ptr_array_add(paths, item->data);
+        }
+        g_slist_free(files);
+    }
+
+    g_ptr_array_add(paths, NULL);
+    servo_gtk_web_view_respond_to_file_chooser(
+        closure->web_view, closure->request_id, (const gchar *const *) paths->pdata);
+
+    g_ptr_array_free(paths, TRUE);
+    g_object_unref(native);
+}
+
+/*
+ * Class closure for ::run-file-chooser: present the chooser ourselves. Runs
+ * only when no handler claimed it by returning TRUE.
+ */
+static gboolean
+servo_gtk_web_view_default_run_file_chooser(ServoGtkWebView    *self,
+                                            const gchar *const *filter_patterns,
+                                            gboolean            allow_multiple,
+                                            guint64             request_id)
+{
+    FileChooserClosure  *closure;
+    GtkFileChooserNative *native;
+    GtkFileFilter       *filter;
+    GtkWidget           *toplevel;
+    GtkWindow           *parent = NULL;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(self));
+    if (toplevel != NULL && gtk_widget_is_toplevel(toplevel)) {
+        parent = GTK_WINDOW(toplevel);
+    }
+
+    native = gtk_file_chooser_native_new("Select File", parent,
+                                         GTK_FILE_CHOOSER_ACTION_OPEN,
+                                         "_Open", "_Cancel");
+    gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(native), allow_multiple);
+
+    filter = servo_gtk_web_view_build_file_filter(filter_patterns);
+    if (filter != NULL) {
+        gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(native), filter);
+    }
+
+    closure = g_new0(FileChooserClosure, 1);
+    closure->web_view = g_object_ref(self);
+    closure->request_id = request_id;
+
+    g_signal_connect_data(native, "response",
+                          G_CALLBACK(on_file_chooser_response), closure,
+                          file_chooser_closure_free, 0);
+
+    gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+
+    return TRUE;
+}
+
+/*
+ * Web content activated an <input type=file>. As with dialogs this only reports
+ * the request; the chosen paths travel back later through
+ * servo_gtk_web_view_respond_to_file_chooser().
+ */
+static void
+servo_gtk_web_view_on_file_picker(guint64            request_id,
+                                  const char *const *filter_patterns,
+                                  gsize              filter_pattern_count,
+                                  bool               allow_multiple,
+                                  gpointer           user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gboolean         handled = FALSE;
+    GPtrArray       *patterns = g_ptr_array_new();
+
+    for (gsize i = 0; i < filter_pattern_count; i++) {
+        g_ptr_array_add(patterns, (gpointer) filter_patterns[i]);
+    }
+    g_ptr_array_add(patterns, NULL);
+
+    g_signal_emit(self, signals[RUN_FILE_CHOOSER], 0,
+                  patterns->pdata, (gboolean) allow_multiple, request_id, &handled);
+
+    g_ptr_array_free(patterns, TRUE);
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -670,6 +813,8 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
                 self->servo, servo_gtk_web_view_on_history_changed, self);
             servo_webview_set_dialog_callback(
                 self->servo, servo_gtk_web_view_on_dialog, self);
+            servo_webview_set_file_picker_callback(
+                self->servo, servo_gtk_web_view_on_file_picker, self);
             servo_webview_set_request_cancelled_callback(
                 self->servo, servo_gtk_web_view_on_request_cancelled, self);
         }
@@ -933,6 +1078,7 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
     object_class->finalize = servo_gtk_web_view_finalize;
 
     klass->script_dialog = servo_gtk_web_view_default_script_dialog;
+    klass->run_file_chooser = servo_gtk_web_view_default_run_file_chooser;
 
     widget_class->draw = servo_gtk_web_view_draw;
     widget_class->size_allocate = servo_gtk_web_view_size_allocate;
@@ -1103,6 +1249,38 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             1,
             G_TYPE_UINT64
         );
+
+    /**
+     * ServoGtkWebView::run-file-chooser:
+     * @self: the #ServoGtkWebView
+     * @filter_patterns: (array zero-terminated=1): bare filename extensions
+     *   with no leading dot (e.g. "png"); empty if any file is acceptable
+     * @allow_multiple: whether more than one file may be chosen
+     * @request_id: identifies this chooser when answering it
+     *
+     * Emitted when web content activates an `&lt;input type=file&gt;`. The
+     * default handler presents a file chooser and answers it.
+     *
+     * Return %TRUE from a handler to present your own chooser instead; you must
+     * then call servo_gtk_web_view_respond_to_file_chooser() with @request_id,
+     * since the page's script stays blocked until you do.
+     *
+     * Returns: %TRUE to stop the built-in chooser from being shown
+     */
+    signals[RUN_FILE_CHOOSER] =
+        g_signal_new(
+            "run-file-chooser",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, run_file_chooser),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            3,
+            G_TYPE_STRV,
+            G_TYPE_BOOLEAN,
+            G_TYPE_UINT64
+        );
 }
 
 static void
@@ -1244,6 +1422,26 @@ servo_gtk_web_view_respond_to_dialog(ServoGtkWebView *self,
     if (self->servo != NULL) {
         servo_webview_dialog_respond(self->servo, request_id, accepted, text);
     }
+}
+
+void
+servo_gtk_web_view_respond_to_file_chooser(ServoGtkWebView    *self,
+                                           guint64             request_id,
+                                           const gchar *const *paths)
+{
+    gsize count = 0;
+
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo == NULL) {
+        return;
+    }
+
+    while (paths != NULL && paths[count] != NULL) {
+        count++;
+    }
+
+    servo_webview_file_picker_respond(self->servo, request_id, paths, count);
 }
 
 /*

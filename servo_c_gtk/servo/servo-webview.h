@@ -15,6 +15,7 @@
 #define SERVO_WEBVIEW_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -103,6 +104,21 @@ typedef void (*ServoDialogCallback)(uint64_t    request_id,
                                     void       *user_data);
 
 /*
+ * Invoked when web content activates an <input type=file>. The picker is NOT
+ * answered when this returns: show a file chooser and call
+ * servo_webview_file_picker_respond() with `request_id` once the user answers.
+ *
+ * `filter_patterns` holds `filter_pattern_count` bare filename extensions with
+ * no leading dot (e.g. "png"), valid only for the duration of the call; an
+ * empty array means any file is acceptable.
+ */
+typedef void (*ServoFilePickerCallback)(uint64_t           request_id,
+                                        const char *const *filter_patterns,
+                                        size_t             filter_pattern_count,
+                                        bool               allow_multiple,
+                                        void              *user_data);
+
+/*
  * Invoked when Servo withdraws a request that has not been answered — the page
  * navigated away, or the element left the document. Take down whatever UI is
  * showing for `request_id`; responding to it afterwards does nothing.
@@ -168,6 +184,21 @@ void servo_webview_dialog_respond(ServoWebViewHandle *webview,
                                   uint64_t            request_id,
                                   bool                accepted,
                                   const char         *text);
+
+void servo_webview_set_file_picker_callback(ServoWebViewHandle     *webview,
+                                            ServoFilePickerCallback callback,
+                                            void                   *user_data);
+
+/*
+ * Answer a file picker reported through a ServoFilePickerCallback. `paths` is
+ * an array of `path_count` file paths the user chose; a NULL `paths` or a
+ * `path_count` of 0 means the picker was dismissed with no selection. An
+ * unknown `request_id` is ignored.
+ */
+void servo_webview_file_picker_respond(ServoWebViewHandle *webview,
+                                       uint64_t            request_id,
+                                       const char *const  *paths,
+                                       size_t              path_count);
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);

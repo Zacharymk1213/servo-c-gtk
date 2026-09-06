@@ -23,6 +23,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Once;
@@ -30,7 +31,8 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    EmbedderControl, EmbedderControlId, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    EmbedderControl, EmbedderControlId, FilePicker, Key, KeyState, KeyboardEvent, LoadStatus,
+    Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
     PrefValue, Preferences, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
@@ -91,6 +93,21 @@ pub type ServoDialogCallback = extern "C" fn(
     user_data: *mut c_void,
 );
 
+/// Called when web content activates an `<input type=file>`.
+///
+/// The picker is *not* answered when this returns: the host shows its own file
+/// chooser and later calls [`servo_webview_file_picker_respond`] with
+/// `request_id`. `filter_patterns` is an array of `filter_pattern_count` bare
+/// filename extensions with no leading dot (e.g. `"png"`), valid only for the
+/// duration of the call; an empty array means any file is acceptable.
+pub type ServoFilePickerCallback = extern "C" fn(
+    request_id: u64,
+    filter_patterns: *const *const c_char,
+    filter_pattern_count: usize,
+    allow_multiple: bool,
+    user_data: *mut c_void,
+);
+
 /// Called when Servo withdraws a request the host has not answered yet — the
 /// page navigated away, or the element went out of the document. The host
 /// should take down whatever UI it put up for `request_id`; responding to it
@@ -114,6 +131,7 @@ mod servo_dialog {
 /// down while dialogs are open never leaves script blocked forever.
 enum PendingRequest {
     SimpleDialog(SimpleDialog),
+    FilePicker(FilePicker),
 }
 
 /// A [`PendingRequest`] plus the engine-side id it arrived with, which is what
@@ -213,6 +231,11 @@ struct RequestCancelledCallback {
     user_data: *mut c_void,
 }
 
+struct FilePickerCallback {
+    func: ServoFilePickerCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -224,6 +247,7 @@ struct EmbedderDelegate {
     load_status_callback: RefCell<Option<LoadStatusCallback>>,
     history_callback: RefCell<Option<HistoryCallback>>,
     dialog_callback: RefCell<Option<DialogCallback>>,
+    file_picker_callback: RefCell<Option<FilePickerCallback>>,
     request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
     requests: RequestRegistry,
 }
@@ -239,6 +263,7 @@ impl EmbedderDelegate {
             load_status_callback: RefCell::new(None),
             history_callback: RefCell::new(None),
             dialog_callback: RefCell::new(None),
+            file_picker_callback: RefCell::new(None),
             request_cancelled_callback: RefCell::new(None),
             requests: RequestRegistry::default(),
         }
@@ -339,6 +364,7 @@ impl WebViewDelegate for EmbedderDelegate {
 
         match embedder_control {
             EmbedderControl::SimpleDialog(dialog) => self.show_simple_dialog(control_id, dialog),
+            EmbedderControl::FilePicker(picker) => self.show_file_picker(control_id, picker),
             // Select-element pickers, colour pickers and IME are not wired up
             // yet. Dropping the control answers it with its default (dismissed
             // / no selection) rather than leaving script waiting.
@@ -405,6 +431,43 @@ impl EmbedderDelegate {
             default_value
                 .as_ref()
                 .map_or(ptr::null(), |value| value.as_ptr()),
+            user_data,
+        );
+    }
+
+    /// Hand an `<input type=file>` activation to the host and keep the picker
+    /// alive until the host answers. With no callback registered the picker is
+    /// dropped here, which answers it as dismissed.
+    fn show_file_picker(&self, control_id: EmbedderControlId, picker: FilePicker) {
+        let cb = self
+            .file_picker_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        // Keep the CStrings alive for the duration of the call; the array we
+        // pass out only borrows their pointers.
+        let patterns: Vec<CString> = picker
+            .filter_patterns()
+            .iter()
+            .filter_map(|pattern| CString::new(pattern.0.as_str()).ok())
+            .collect();
+        let pattern_ptrs: Vec<*const c_char> =
+            patterns.iter().map(|pattern| pattern.as_ptr()).collect();
+        let allow_multiple = picker.allow_select_multiple();
+
+        let id = self
+            .requests
+            .insert(control_id, PendingRequest::FilePicker(picker));
+
+        func(
+            id,
+            pattern_ptrs.as_ptr(),
+            pattern_ptrs.len(),
+            allow_multiple,
             user_data,
         );
     }
@@ -795,6 +858,78 @@ pub unsafe extern "C" fn servo_webview_set_request_cancelled_callback(
     };
     *handle.delegate.request_cancelled_callback.borrow_mut() =
         callback.map(|func| RequestCancelledCallback { func, user_data });
+}
+
+/// Register the file-picker callback, invoked when web content activates an
+/// `<input type=file>`. Pass a NULL `callback` to clear it.
+///
+/// With no callback registered, pickers are answered immediately as dismissed
+/// so that script never blocks on UI that will not appear.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_file_picker_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoFilePickerCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.file_picker_callback.borrow_mut() =
+        callback.map(|func| FilePickerCallback { func, user_data });
+}
+
+/// Answer a file picker previously reported through a
+/// [`ServoFilePickerCallback`].
+///
+/// `paths` is an array of `path_count` NUL-terminated file paths the user
+/// chose. A NULL `paths` or a `path_count` of 0 means the picker was dismissed
+/// with no selection. Paths that are not valid UTF-8 are skipped; if that
+/// leaves nothing, the picker is dismissed rather than submitted empty.
+///
+/// An unknown `request_id` — one already answered, or withdrawn by Servo — is
+/// ignored.
+///
+/// # Safety
+/// `webview` must be a valid handle. When `path_count` is non-zero, `paths`
+/// must point to that many valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_file_picker_respond(
+    webview: *mut ServoWebViewHandle,
+    request_id: u64,
+    paths: *const *const c_char,
+    path_count: usize,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    let Some(PendingRequest::FilePicker(mut picker)) = handle.delegate.requests.take(request_id)
+    else {
+        return;
+    };
+
+    if paths.is_null() || path_count == 0 {
+        picker.dismiss();
+        return;
+    }
+
+    let selected: Vec<PathBuf> = unsafe { std::slice::from_raw_parts(paths, path_count) }
+        .iter()
+        .filter(|path| !path.is_null())
+        .filter_map(|path| unsafe { CStr::from_ptr(*path) }.to_str().ok())
+        .map(PathBuf::from)
+        .collect();
+
+    if selected.is_empty() {
+        picker.dismiss();
+        return;
+    }
+
+    picker.select(&selected);
+    picker.submit();
 }
 
 /// Answer a dialog previously reported through a [`ServoDialogCallback`].

@@ -101,6 +101,23 @@ servo_webview_dialog_respond(ServoWebViewHandle *webview,
     (void) webview; (void) request_id; (void) accepted; (void) text;
 }
 
+void
+servo_webview_set_file_picker_callback(ServoWebViewHandle     *webview,
+                                       ServoFilePickerCallback callback,
+                                       void                   *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_file_picker_respond(ServoWebViewHandle *webview,
+                                  uint64_t            request_id,
+                                  const char *const  *paths,
+                                  size_t              path_count)
+{
+    (void) webview; (void) request_id; (void) paths; (void) path_count;
+}
+
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 {
     (void) webview; (void) uri;

@@ -22,6 +22,7 @@ enum {
     LOAD_CHANGED,
     SCRIPT_DIALOG,
     SCRIPT_DIALOG_CANCELLED,
+    RUN_FILE_CHOOSER,
     N_SIGNALS
 };
 
@@ -477,6 +478,172 @@ servo_gtk_web_view_on_request_cancelled(guint64 request_id, gpointer user_data)
     g_signal_emit(self, signals[SCRIPT_DIALOG_CANCELLED], 0, request_id);
 }
 
+/* ------------------------------------------------------------------ *
+ * Built-in file chooser
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    ServoGtkWebView *web_view;    /* holds a reference */
+    guint64          request_id;
+} FileChooserClosure;
+
+/* Build a GtkFileFilter from Servo's bare extensions, or NULL for "any file". */
+static GtkFileFilter *
+servo_gtk_web_view_build_file_filter(const gchar *const *filter_patterns)
+{
+    GtkFileFilter *filter;
+
+    if (filter_patterns == NULL || filter_patterns[0] == NULL) {
+        return NULL;
+    }
+
+    filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "Accepted files");
+
+    for (gsize i = 0; filter_patterns[i] != NULL; i++) {
+        /* Servo reports extensions without the dot; GTK wants a glob. */
+        gchar *glob = g_strconcat("*.", filter_patterns[i], NULL);
+        gtk_file_filter_add_pattern(filter, glob);
+        g_free(glob);
+    }
+
+    return filter;
+}
+
+/*
+ * GtkFileDialog finished. Turn the result into the NULL-terminated path array
+ * the widget answers with; an error (including the user dismissing the dialog)
+ * answers with no selection.
+ */
+static void
+on_file_chooser_ready(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    FileChooserClosure *closure = user_data;
+    GtkFileDialog      *dialog = GTK_FILE_DIALOG(source);
+    GPtrArray          *paths = g_ptr_array_new_with_free_func(g_free);
+    GListModel         *files = NULL;
+    GFile              *file = NULL;
+
+    if (g_object_get_data(G_OBJECT(dialog), "servo-gtk-allow-multiple") != NULL) {
+        files = gtk_file_dialog_open_multiple_finish(dialog, result, NULL);
+    } else {
+        file = gtk_file_dialog_open_finish(dialog, result, NULL);
+    }
+
+    if (files != NULL) {
+        guint n_files = g_list_model_get_n_items(files);
+
+        for (guint i = 0; i < n_files; i++) {
+            GFile *item = g_list_model_get_item(files, i);
+            gchar *path = g_file_get_path(item);
+
+            /* Servo takes filesystem paths, so a non-local file is unusable. */
+            if (path != NULL) {
+                g_ptr_array_add(paths, path);
+            }
+            g_object_unref(item);
+        }
+        g_object_unref(files);
+    } else if (file != NULL) {
+        gchar *path = g_file_get_path(file);
+
+        if (path != NULL) {
+            g_ptr_array_add(paths, path);
+        }
+        g_object_unref(file);
+    }
+
+    g_ptr_array_add(paths, NULL);
+    servo_gtk_web_view_respond_to_file_chooser(
+        closure->web_view, closure->request_id, (const gchar *const *) paths->pdata);
+
+    g_ptr_array_free(paths, TRUE);
+    g_object_unref(closure->web_view);
+    g_free(closure);
+}
+
+/*
+ * Class closure for ::run-file-chooser: present the chooser ourselves. Runs
+ * only when no handler claimed it by returning TRUE.
+ */
+static gboolean
+servo_gtk_web_view_default_run_file_chooser(ServoGtkWebView    *self,
+                                            const gchar *const *filter_patterns,
+                                            gboolean            allow_multiple,
+                                            guint64             request_id)
+{
+    FileChooserClosure *closure;
+    GtkFileDialog      *dialog;
+    GtkFileFilter      *filter;
+    GtkRoot            *root;
+    GtkWindow          *parent = NULL;
+
+    dialog = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dialog, "Select File");
+    gtk_file_dialog_set_modal(dialog, TRUE);
+
+    filter = servo_gtk_web_view_build_file_filter(filter_patterns);
+    if (filter != NULL) {
+        GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+
+        g_list_store_append(filters, filter);
+        gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
+        gtk_file_dialog_set_default_filter(dialog, filter);
+        g_object_unref(filters);
+        g_object_unref(filter);
+    }
+
+    root = gtk_widget_get_root(GTK_WIDGET(self));
+    if (root != NULL && GTK_IS_WINDOW(root)) {
+        parent = GTK_WINDOW(root);
+    }
+
+    closure = g_new0(FileChooserClosure, 1);
+    closure->web_view = g_object_ref(self);
+    closure->request_id = request_id;
+
+    if (allow_multiple) {
+        /* Read back in the finish callback to pick the matching _finish(). */
+        g_object_set_data(G_OBJECT(dialog), "servo-gtk-allow-multiple",
+                          GINT_TO_POINTER(1));
+        gtk_file_dialog_open_multiple(dialog, parent, NULL,
+                                      on_file_chooser_ready, closure);
+    } else {
+        gtk_file_dialog_open(dialog, parent, NULL, on_file_chooser_ready, closure);
+    }
+
+    g_object_unref(dialog);
+
+    return TRUE;
+}
+
+/*
+ * Web content activated an <input type=file>. As with dialogs this only reports
+ * the request; the chosen paths travel back later through
+ * servo_gtk_web_view_respond_to_file_chooser().
+ */
+static void
+servo_gtk_web_view_on_file_picker(guint64            request_id,
+                                  const char *const *filter_patterns,
+                                  gsize              filter_pattern_count,
+                                  bool               allow_multiple,
+                                  gpointer           user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gboolean         handled = FALSE;
+    GPtrArray       *patterns = g_ptr_array_new();
+
+    for (gsize i = 0; i < filter_pattern_count; i++) {
+        g_ptr_array_add(patterns, (gpointer) filter_patterns[i]);
+    }
+    g_ptr_array_add(patterns, NULL);
+
+    g_signal_emit(self, signals[RUN_FILE_CHOOSER], 0,
+                  patterns->pdata, (gboolean) allow_multiple, request_id, &handled);
+
+    g_ptr_array_free(patterns, TRUE);
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -690,6 +857,8 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
                 self->servo, servo_gtk_web_view_on_history_changed, self);
             servo_webview_set_dialog_callback(
                 self->servo, servo_gtk_web_view_on_dialog, self);
+            servo_webview_set_file_picker_callback(
+                self->servo, servo_gtk_web_view_on_file_picker, self);
             servo_webview_set_request_cancelled_callback(
                 self->servo, servo_gtk_web_view_on_request_cancelled, self);
         }
@@ -989,6 +1158,7 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
     object_class->finalize = servo_gtk_web_view_finalize;
 
     klass->script_dialog = servo_gtk_web_view_default_script_dialog;
+    klass->run_file_chooser = servo_gtk_web_view_default_run_file_chooser;
 
     properties[PROP_URI] =
         g_param_spec_string(
@@ -1148,6 +1318,38 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             NULL,       /* default (generic) C marshaller */
             G_TYPE_NONE,
             1,
+            G_TYPE_UINT64
+        );
+
+    /**
+     * ServoGtkWebView::run-file-chooser:
+     * @self: the #ServoGtkWebView
+     * @filter_patterns: (array zero-terminated=1): bare filename extensions
+     *   with no leading dot (e.g. "png"); empty if any file is acceptable
+     * @allow_multiple: whether more than one file may be chosen
+     * @request_id: identifies this chooser when answering it
+     *
+     * Emitted when web content activates an `&lt;input type=file&gt;`. The
+     * default handler presents a file chooser and answers it.
+     *
+     * Return %TRUE from a handler to present your own chooser instead; you must
+     * then call servo_gtk_web_view_respond_to_file_chooser() with @request_id,
+     * since the page's script stays blocked until you do.
+     *
+     * Returns: %TRUE to stop the built-in chooser from being shown
+     */
+    signals[RUN_FILE_CHOOSER] =
+        g_signal_new(
+            "run-file-chooser",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, run_file_chooser),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            3,
+            G_TYPE_STRV,
+            G_TYPE_BOOLEAN,
             G_TYPE_UINT64
         );
 }
@@ -1312,6 +1514,26 @@ servo_gtk_web_view_respond_to_dialog(ServoGtkWebView *self,
     if (self->servo != NULL) {
         servo_webview_dialog_respond(self->servo, request_id, accepted, text);
     }
+}
+
+void
+servo_gtk_web_view_respond_to_file_chooser(ServoGtkWebView    *self,
+                                           guint64             request_id,
+                                           const gchar *const *paths)
+{
+    gsize count = 0;
+
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo == NULL) {
+        return;
+    }
+
+    while (paths != NULL && paths[count] != NULL) {
+        count++;
+    }
+
+    servo_webview_file_picker_respond(self->servo, request_id, paths, count);
 }
 
 /*

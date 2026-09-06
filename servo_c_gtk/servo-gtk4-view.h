@@ -92,9 +92,20 @@ struct _ServoGtkWebViewClass {
                                guint64                   request_id);
     void (*script_dialog_cancelled) (ServoGtkWebView *web_view,
                                      guint64          request_id);
+    gboolean (*run_file_chooser) (ServoGtkWebView    *web_view,
+                                  const gchar *const *filter_patterns,
+                                  gboolean            allow_multiple,
+                                  guint64             request_id);
 
-    /* Padding for future expansion */
+    /*
+     * Padding for future expansion. The original four slots were consumed by
+     * the signals above; these replenish them, so the class struct grows once
+     * here rather than on the next signal added.
+     */
     void (*_gtk_reserved1) (void);
+    void (*_gtk_reserved2) (void);
+    void (*_gtk_reserved3) (void);
+    void (*_gtk_reserved4) (void);
 };
 
 /**
@@ -212,6 +223,25 @@ void servo_gtk_web_view_respond_to_dialog(ServoGtkWebView *self,
                                           guint64          request_id,
                                           gboolean         accepted,
                                           const gchar     *text);
+
+/**
+ * servo_gtk_web_view_respond_to_file_chooser:
+ * @self: a #ServoGtkWebView
+ * @request_id: the id from the #ServoGtkWebView::run-file-chooser emission
+ * @paths: (array zero-terminated=1) (nullable): the chosen file paths, or
+ *   %NULL if the chooser was dismissed with no selection
+ *
+ * Answers a file chooser reported by #ServoGtkWebView::run-file-chooser. Only
+ * needed by a handler that returned %TRUE to present its own chooser — the
+ * built-in one answers on its own.
+ *
+ * The page's script is blocked until the chooser is answered. Answering a
+ * @request_id that has already been answered, or that Servo withdrew, does
+ * nothing.
+ */
+void servo_gtk_web_view_respond_to_file_chooser(ServoGtkWebView    *self,
+                                                guint64             request_id,
+                                                const gchar *const *paths);
 
 /**
  * servo_gtk_web_view_reload:
