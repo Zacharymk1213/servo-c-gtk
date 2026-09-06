@@ -93,6 +93,28 @@ on_web_view_uri_changed(ServoGtkWebView *web_view, const gchar *uri, gpointer us
     }
 }
 
+/* Toolbar buttons: forward to the web view's session-history entry points. */
+static void
+on_back_clicked(GtkButton *button, gpointer user_data)
+{
+    (void) button;
+    servo_gtk_web_view_go_back(SERVO_GTK_WEB_VIEW(user_data));
+}
+
+static void
+on_forward_clicked(GtkButton *button, gpointer user_data)
+{
+    (void) button;
+    servo_gtk_web_view_go_forward(SERVO_GTK_WEB_VIEW(user_data));
+}
+
+static void
+on_reload_clicked(GtkButton *button, gpointer user_data)
+{
+    (void) button;
+    servo_gtk_web_view_reload(SERVO_GTK_WEB_VIEW(user_data));
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -100,6 +122,9 @@ activate(GtkApplication *app, gpointer user_data)
     GtkWidget  *box;
     GtkWidget  *label;
     GtkWidget  *url_bar;
+    GtkWidget  *back_button;
+    GtkWidget  *forward_button;
+    GtkWidget  *reload_button;
     GtkWidget  *url_entry;
     GtkWidget  *color_button;
     GtkWidget  *web_view;
@@ -137,6 +162,21 @@ activate(GtkApplication *app, gpointer user_data)
     gtk_widget_set_margin_start(url_bar, 12);
     gtk_widget_set_margin_end(url_bar, 12);
     gtk_widget_set_margin_bottom(url_bar, 12);
+
+    back_button = gtk_button_new_from_icon_name("go-previous-symbolic");
+    gtk_widget_set_tooltip_text(back_button, "Go back");
+    g_signal_connect(back_button, "clicked", G_CALLBACK(on_back_clicked), web_view);
+    gtk_box_append(GTK_BOX(url_bar), back_button);
+
+    forward_button = gtk_button_new_from_icon_name("go-next-symbolic");
+    gtk_widget_set_tooltip_text(forward_button, "Go forward");
+    g_signal_connect(forward_button, "clicked", G_CALLBACK(on_forward_clicked), web_view);
+    gtk_box_append(GTK_BOX(url_bar), forward_button);
+
+    reload_button = gtk_button_new_from_icon_name("view-refresh-symbolic");
+    gtk_widget_set_tooltip_text(reload_button, "Reload the current page");
+    g_signal_connect(reload_button, "clicked", G_CALLBACK(on_reload_clicked), web_view);
+    gtk_box_append(GTK_BOX(url_bar), reload_button);
 
     url_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(url_entry), "Enter URL and press Enter");

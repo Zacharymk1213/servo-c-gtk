@@ -572,6 +572,41 @@ servo_gtk_web_view_get_uri(ServoGtkWebView *self)
 }
 
 /*
+ * Session-history and reload entry points. Each is a thin forward to the
+ * matching FFI call; Servo is created lazily on the first allocation, so a
+ * call made before then has nothing to act on and is silently ignored.
+ */
+void
+servo_gtk_web_view_reload(ServoGtkWebView *self)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo != NULL) {
+        servo_webview_reload(self->servo);
+    }
+}
+
+void
+servo_gtk_web_view_go_back(ServoGtkWebView *self)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo != NULL) {
+        servo_webview_go_back(self->servo);
+    }
+}
+
+void
+servo_gtk_web_view_go_forward(ServoGtkWebView *self)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo != NULL) {
+        servo_webview_go_forward(self->servo);
+    }
+}
+
+/*
  * One-shot context bridging the Servo FFI callback (which only knows a
  * user_data pointer) back to the public GTK callback (which also receives the
  * originating web view). Heap-allocated because Servo delivers the result

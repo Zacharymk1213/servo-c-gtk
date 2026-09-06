@@ -80,6 +80,33 @@ void servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri);
 const gchar *servo_gtk_web_view_get_uri(ServoGtkWebView *self);
 
 /**
+ * servo_gtk_web_view_reload:
+ * @self: a #ServoGtkWebView
+ *
+ * Reloads the current page. Does nothing if the web view has not been
+ * realized yet (Servo is created on first allocation).
+ */
+void servo_gtk_web_view_reload(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_go_back:
+ * @self: a #ServoGtkWebView
+ *
+ * Navigates one entry back in the session history. Does nothing if there is
+ * no previous entry, or if the web view has not been realized yet.
+ */
+void servo_gtk_web_view_go_back(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_go_forward:
+ * @self: a #ServoGtkWebView
+ *
+ * Navigates one entry forward in the session history. Does nothing if there
+ * is no next entry, or if the web view has not been realized yet.
+ */
+void servo_gtk_web_view_go_forward(ServoGtkWebView *self);
+
+/**
  * ServoGtkScriptResultCallback:
  * @web_view: the #ServoGtkWebView the script ran in
  * @result_json: (nullable): the script's return value serialized as a JSON
