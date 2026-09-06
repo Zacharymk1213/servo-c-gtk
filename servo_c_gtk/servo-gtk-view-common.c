@@ -155,14 +155,6 @@ servo_gtk_permission_feature_get_type(void)
     return (GType) type_id;
 }
 
-/* Matches GdkPixbufDestroyNotify; frees the RGBA buffer owned by the pixbuf. */
-static void
-servo_gtk_web_view_free_frame_data(guchar *pixels, gpointer data)
-{
-    (void) data;
-    g_free(pixels);
-}
-
 /*
  * Servo delivers a finished frame as a tightly-packed RGBA8 buffer that is only
  * valid for the duration of the callback, so we copy it into a GdkPixbuf (which
@@ -176,23 +168,49 @@ servo_gtk_web_view_on_frame_ready(const guint8 *rgba,
                                   gpointer      user_data)
 {
     ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gsize            row_bytes = (gsize) width * 4;
+    guchar          *pixels;
+    gint             rowstride;
 
-    gsize    size = (gsize) width * height * 4;
-    guint8  *copy = g_memdup2(rgba, size);
-    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(
-        copy,
-        GDK_COLORSPACE_RGB,
-        TRUE,                 /* has_alpha */
-        8,                    /* bits_per_sample */
-        (int) width,
-        (int) height,
-        (int) (width * 4),    /* rowstride */
-        servo_gtk_web_view_free_frame_data,
-        NULL
-    );
+    if (width == 0 || height == 0) {
+        return;
+    }
 
-    g_clear_object(&self->frame);
-    self->frame = pixbuf;
+    /*
+     * The pixbuf is kept and refilled rather than rebuilt: this runs once per
+     * rendered frame, so allocating and freeing a whole surface each time is
+     * pure churn. Only a size change needs a new one.
+     */
+    if (self->frame == NULL ||
+        gdk_pixbuf_get_width(self->frame) != (int) width ||
+        gdk_pixbuf_get_height(self->frame) != (int) height) {
+        g_clear_object(&self->frame);
+        self->frame = gdk_pixbuf_new(GDK_COLORSPACE_RGB,
+                                     TRUE,           /* has_alpha */
+                                     8,              /* bits_per_sample */
+                                     (int) width,
+                                     (int) height);
+        if (self->frame == NULL) {
+            return;
+        }
+    }
+
+    pixels = gdk_pixbuf_get_pixels(self->frame);
+    rowstride = gdk_pixbuf_get_rowstride(self->frame);
+
+    /*
+     * Servo's buffer is tightly packed; a pixbuf's rows may be padded, so only
+     * copy in one go when the two agree.
+     */
+    if ((gsize) rowstride == row_bytes) {
+        memcpy(pixels, rgba, row_bytes * height);
+    } else {
+        for (guint32 row = 0; row < height; row++) {
+            memcpy(pixels + (gsize) row * rowstride,
+                   rgba + (gsize) row * row_bytes,
+                   row_bytes);
+        }
+    }
 
     gtk_widget_queue_draw(GTK_WIDGET(self));
 }
