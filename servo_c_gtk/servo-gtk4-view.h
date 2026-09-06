@@ -16,6 +16,25 @@ typedef struct ServoWebViewHandle ServoWebViewHandle;
 #define SERVO_GTK_IS_WEB_VIEW_GET_CLASS(obj)   (G_TYPE_INSTANCE_GET_CLASS ((obj), SERVO_GTK_TYPE_WEB_VIEW, ServoGtkWebViewClass))
 
 
+/**
+ * ServoGtkLoadEvent:
+ * @SERVO_GTK_LOAD_STARTED: a new load has begun; its headers are not parsed yet
+ * @SERVO_GTK_LOAD_COMMITTED: the &lt;head&gt; has been parsed and the document
+ *   body is reachable from script
+ * @SERVO_GTK_LOAD_FINISHED: the document and all its subresources have loaded
+ *
+ * The stage a load reported by #ServoGtkWebView::load-changed has reached.
+ */
+typedef enum {
+    SERVO_GTK_LOAD_STARTED,
+    SERVO_GTK_LOAD_COMMITTED,
+    SERVO_GTK_LOAD_FINISHED
+} ServoGtkLoadEvent;
+
+#define SERVO_GTK_TYPE_LOAD_EVENT              (servo_gtk_load_event_get_type ())
+
+GType servo_gtk_load_event_get_type (void) G_GNUC_CONST;
+
 typedef struct _ServoGtkWebView              ServoGtkWebView;
 typedef struct _ServoGtkWebViewPrivate       ServoGtkWebViewPrivate;
 typedef struct _ServoGtkWebViewClass         ServoGtkWebViewClass;
@@ -43,12 +62,13 @@ struct _ServoGtkWebViewClass {
     /* Signals */
     void (*uri_changed) (ServoGtkWebView *web_view,
                          const gchar     *uri);
+    void (*load_changed) (ServoGtkWebView   *web_view,
+                          ServoGtkLoadEvent  load_event);
 
     /* Padding for future expansion */
     void (*_gtk_reserved1) (void);
     void (*_gtk_reserved2) (void);
     void (*_gtk_reserved3) (void);
-    void (*_gtk_reserved4) (void);
 };
 
 /**
@@ -78,6 +98,51 @@ void servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri);
  * Returns: (nullable): the current URI
  */
 const gchar *servo_gtk_web_view_get_uri(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_get_title:
+ * @self: a #ServoGtkWebView
+ *
+ * Gets the title of the loaded page.
+ *
+ * Returns: (nullable): the page title, or %NULL if the page has no title. The
+ *   string is owned by @self and is valid until the title changes again.
+ */
+const gchar *servo_gtk_web_view_get_title(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_is_loading:
+ * @self: a #ServoGtkWebView
+ *
+ * Whether a load is currently in progress, i.e. #ServoGtkWebView::load-changed
+ * has reported %SERVO_GTK_LOAD_STARTED without a matching
+ * %SERVO_GTK_LOAD_FINISHED yet.
+ *
+ * Returns: %TRUE while a load is in progress
+ */
+gboolean servo_gtk_web_view_is_loading(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_can_go_back:
+ * @self: a #ServoGtkWebView
+ *
+ * Whether there is a previous entry in the session history, i.e. whether
+ * servo_gtk_web_view_go_back() would do anything.
+ *
+ * Returns: %TRUE if the web view can go back
+ */
+gboolean servo_gtk_web_view_can_go_back(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_can_go_forward:
+ * @self: a #ServoGtkWebView
+ *
+ * Whether there is a following entry in the session history, i.e. whether
+ * servo_gtk_web_view_go_forward() would do anything.
+ *
+ * Returns: %TRUE if the web view can go forward
+ */
+gboolean servo_gtk_web_view_can_go_forward(ServoGtkWebView *self);
 
 /**
  * servo_gtk_web_view_reload:

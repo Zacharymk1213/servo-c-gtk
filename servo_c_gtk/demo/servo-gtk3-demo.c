@@ -115,6 +115,36 @@ on_reload_clicked(GtkButton *button, gpointer user_data)
     servo_gtk_web_view_reload(SERVO_GTK_WEB_VIEW(user_data));
 }
 
+/* The page title changed: mirror it in the window title. */
+static void
+on_web_view_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+{
+    ServoGtkWebView *web_view = SERVO_GTK_WEB_VIEW(object);
+    GtkWindow       *window = GTK_WINDOW(user_data);
+    const gchar     *title = servo_gtk_web_view_get_title(web_view);
+
+    (void) pspec;
+
+    gtk_window_set_title(window, title != NULL ? title : "Servo GTK Demo");
+}
+
+/* Report how far the current load has got. */
+static void
+on_web_view_load_changed(ServoGtkWebView   *web_view,
+                         ServoGtkLoadEvent  load_event,
+                         gpointer           user_data)
+{
+    (void) web_view;
+    (void) user_data;
+
+    switch (load_event) {
+    case SERVO_GTK_LOAD_STARTED:   g_print("Load started\n"); break;
+    case SERVO_GTK_LOAD_COMMITTED: g_print("Load committed\n"); break;
+    case SERVO_GTK_LOAD_FINISHED:  g_print("Load finished\n"); break;
+    default: break;
+    }
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -191,6 +221,19 @@ activate(GtkApplication *app, gpointer user_data)
 
     /* Print and reflect URL changes reported by Servo (navigation, redirects). */
     g_signal_connect(web_view, "uri-changed", G_CALLBACK(on_web_view_uri_changed), url_entry);
+
+    /*
+     * Keep the history buttons in step with the session history, mirror the
+     * page title in the window title, and trace load progress.
+     */
+    g_object_bind_property(web_view, "can-go-back", back_button, "sensitive",
+                           G_BINDING_SYNC_CREATE);
+    g_object_bind_property(web_view, "can-go-forward", forward_button, "sensitive",
+                           G_BINDING_SYNC_CREATE);
+    g_signal_connect(web_view, "notify::title",
+                     G_CALLBACK(on_web_view_title_changed), window);
+    g_signal_connect(web_view, "load-changed",
+                     G_CALLBACK(on_web_view_load_changed), NULL);
 
     gtk_box_pack_start(GTK_BOX(box), web_view, TRUE, TRUE, 0);
 

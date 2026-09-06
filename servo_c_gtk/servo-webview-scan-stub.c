@@ -52,6 +52,30 @@ servo_webview_set_url_changed_callback(ServoWebViewHandle     *webview,
     (void) webview; (void) callback; (void) user_data;
 }
 
+void
+servo_webview_set_title_changed_callback(ServoWebViewHandle       *webview,
+                                         ServoTitleChangedCallback callback,
+                                         void                     *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_set_load_status_changed_callback(ServoWebViewHandle            *webview,
+                                               ServoLoadStatusChangedCallback callback,
+                                               void                          *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_set_history_changed_callback(ServoWebViewHandle         *webview,
+                                           ServoHistoryChangedCallback callback,
+                                           void                       *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 {
     (void) webview; (void) uri;
@@ -60,6 +84,16 @@ void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 void servo_webview_reload(ServoWebViewHandle *webview) { (void) webview; }
 void servo_webview_go_back(ServoWebViewHandle *webview) { (void) webview; }
 void servo_webview_go_forward(ServoWebViewHandle *webview) { (void) webview; }
+
+bool servo_webview_can_go_back(ServoWebViewHandle *webview)
+{
+    (void) webview; return false;
+}
+
+bool servo_webview_can_go_forward(ServoWebViewHandle *webview)
+{
+    (void) webview; return false;
+}
 
 void
 servo_webview_resize(ServoWebViewHandle *webview, uint32_t width, uint32_t height)
@@ -103,6 +137,16 @@ servo_webview_key(ServoWebViewHandle *webview,
 }
 
 void servo_webview_spin(ServoWebViewHandle *webview) { (void) webview; }
+
+char *servo_webview_get_title(ServoWebViewHandle *webview)
+{
+    (void) webview; return NULL;
+}
+
+uint32_t servo_webview_get_load_status(ServoWebViewHandle *webview)
+{
+    (void) webview; return SERVO_LOAD_STATUS_COMPLETE;
+}
 
 char *servo_webview_get_uri(ServoWebViewHandle *webview)
 {

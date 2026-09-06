@@ -50,6 +50,36 @@ typedef void (*ServoUrlChangedCallback)(const char *url,
                                         void       *user_data);
 
 /*
+ * Invoked when the page title changes. `title` is a NUL-terminated UTF-8
+ * string valid only for the duration of the call, or NULL when the page has no
+ * title (a fresh navigation clears it).
+ */
+typedef void (*ServoTitleChangedCallback)(const char *title,
+                                          void       *user_data);
+
+/* How far the current load has progressed. */
+typedef enum {
+    /* The load has started; the headers have not been parsed yet. */
+    SERVO_LOAD_STATUS_STARTED = 0,
+    /* <head> has been parsed; the document body is now reachable from script. */
+    SERVO_LOAD_STATUS_HEAD_PARSED = 1,
+    /* The document and all its subresources have loaded. */
+    SERVO_LOAD_STATUS_COMPLETE = 2
+} ServoLoadStatus;
+
+/* Invoked when the load progresses. `status` is a ServoLoadStatus value. */
+typedef void (*ServoLoadStatusChangedCallback)(uint32_t status,
+                                               void    *user_data);
+
+/*
+ * Invoked when the session history changes — on navigation and on history
+ * traversal — with the new availability of the back and forward entries.
+ */
+typedef void (*ServoHistoryChangedCallback)(bool  can_go_back,
+                                            bool  can_go_forward,
+                                            void *user_data);
+
+/*
  * Create a webview with an initial surface of width x height device pixels.
  * `initial_uri` is the URL to load on creation, or NULL to start on
  * about:blank. The initial URL MUST be supplied here rather than via a
@@ -75,12 +105,26 @@ void servo_webview_set_cursor_changed_callback(ServoWebViewHandle        *webvie
 void servo_webview_set_url_changed_callback(ServoWebViewHandle     *webview,
                                             ServoUrlChangedCallback callback,
                                             void                   *user_data);
+void servo_webview_set_title_changed_callback(ServoWebViewHandle       *webview,
+                                              ServoTitleChangedCallback callback,
+                                              void                     *user_data);
+void servo_webview_set_load_status_changed_callback(
+    ServoWebViewHandle            *webview,
+    ServoLoadStatusChangedCallback callback,
+    void                          *user_data);
+void servo_webview_set_history_changed_callback(ServoWebViewHandle         *webview,
+                                                ServoHistoryChangedCallback callback,
+                                                void                       *user_data);
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);
 void servo_webview_reload(ServoWebViewHandle *webview);
 void servo_webview_go_back(ServoWebViewHandle *webview);
 void servo_webview_go_forward(ServoWebViewHandle *webview);
+
+/* Whether the matching history entry exists to traverse to. */
+bool servo_webview_can_go_back(ServoWebViewHandle *webview);
+bool servo_webview_can_go_forward(ServoWebViewHandle *webview);
 
 /* Surface size in device pixels. */
 void servo_webview_resize(ServoWebViewHandle *webview,
@@ -175,6 +219,18 @@ void servo_webview_spin(ServoWebViewHandle *webview);
  * servo_string_free().
  */
 char *servo_webview_get_uri(ServoWebViewHandle *webview);
+
+/*
+ * Current page title as a newly-allocated UTF-8 string, or NULL if the page has
+ * no title. Free with servo_string_free().
+ */
+char *servo_webview_get_title(ServoWebViewHandle *webview);
+
+/*
+ * How far the current load has progressed, as a ServoLoadStatus value. An
+ * invalid handle reports SERVO_LOAD_STATUS_COMPLETE (nothing is loading).
+ */
+uint32_t servo_webview_get_load_status(ServoWebViewHandle *webview);
 
 /* Free a string returned by this library. NULL is a no-op. */
 void servo_string_free(char *string);

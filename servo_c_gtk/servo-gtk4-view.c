@@ -7,6 +7,10 @@
 enum {
     PROP_0,
     PROP_URI,
+    PROP_TITLE,
+    PROP_IS_LOADING,
+    PROP_CAN_GO_BACK,
+    PROP_CAN_GO_FORWARD,
     N_PROPERTIES
 };
 
@@ -14,10 +18,46 @@ static GParamSpec *properties[N_PROPERTIES] = { NULL };
 
 enum {
     URI_CHANGED,
+    LOAD_CHANGED,
     N_SIGNALS
 };
 
 static guint signals[N_SIGNALS] = { 0 };
+
+/*
+ * Embedder-visible page state mirrored from Servo. Kept behind the instance's
+ * `priv` pointer rather than in the public struct so it can grow without
+ * changing the size of #ServoGtkWebView.
+ */
+struct _ServoGtkWebViewPrivate {
+    gchar    *title;
+    gboolean  is_loading;
+    gboolean  can_go_back;
+    gboolean  can_go_forward;
+};
+
+/*
+ * Register ServoGtkLoadEvent as a GType so the ::load-changed signal carries a
+ * proper enumeration rather than a bare integer.
+ */
+GType
+servo_gtk_load_event_get_type(void)
+{
+    static gsize type_id = 0;
+
+    if (g_once_init_enter(&type_id)) {
+        static const GEnumValue values[] = {
+            { SERVO_GTK_LOAD_STARTED,   "SERVO_GTK_LOAD_STARTED",   "started" },
+            { SERVO_GTK_LOAD_COMMITTED, "SERVO_GTK_LOAD_COMMITTED", "committed" },
+            { SERVO_GTK_LOAD_FINISHED,  "SERVO_GTK_LOAD_FINISHED",  "finished" },
+            { 0, NULL, NULL }
+        };
+        GType id = g_enum_register_static("ServoGtkLoadEvent", values);
+        g_once_init_leave(&type_id, id);
+    }
+
+    return (GType) type_id;
+}
 
 G_DEFINE_TYPE(ServoGtkWebView, servo_gtk_web_view, GTK_TYPE_DRAWING_AREA)
 
@@ -96,6 +136,84 @@ servo_gtk_web_view_on_url_changed(const char *url, gpointer user_data)
     g_signal_emit(self, signals[URI_CHANGED], 0, self->uri);
 }
 
+/*
+ * Servo reported a new page title (NULL when the page has none). Cache it for
+ * the "title" property and notify.
+ */
+static void
+servo_gtk_web_view_on_title_changed(const char *title, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    if (g_strcmp0(self->priv->title, title) == 0) {
+        return;
+    }
+
+    g_free(self->priv->title);
+    self->priv->title = g_strdup(title);
+
+    g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_TITLE]);
+}
+
+/*
+ * A load started, had its <head> parsed, or completed. Translate Servo's status
+ * to a #ServoGtkLoadEvent, keep "is-loading" in sync and emit ::load-changed.
+ */
+static void
+servo_gtk_web_view_on_load_status_changed(guint32 status, gpointer user_data)
+{
+    ServoGtkWebView  *self = SERVO_GTK_WEB_VIEW(user_data);
+    ServoGtkLoadEvent load_event;
+    gboolean          is_loading;
+
+    switch (status) {
+    case SERVO_LOAD_STATUS_STARTED:
+        load_event = SERVO_GTK_LOAD_STARTED;
+        is_loading = TRUE;
+        break;
+    case SERVO_LOAD_STATUS_HEAD_PARSED:
+        load_event = SERVO_GTK_LOAD_COMMITTED;
+        is_loading = TRUE;
+        break;
+    case SERVO_LOAD_STATUS_COMPLETE:
+        load_event = SERVO_GTK_LOAD_FINISHED;
+        is_loading = FALSE;
+        break;
+    default:
+        /* An unknown status from a newer library: ignore rather than guess. */
+        return;
+    }
+
+    if (self->priv->is_loading != is_loading) {
+        self->priv->is_loading = is_loading;
+        g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_IS_LOADING]);
+    }
+
+    g_signal_emit(self, signals[LOAD_CHANGED], 0, load_event);
+}
+
+/*
+ * The session history changed (navigation or traversal). Refresh the
+ * "can-go-back" / "can-go-forward" properties.
+ */
+static void
+servo_gtk_web_view_on_history_changed(bool     can_go_back,
+                                      bool     can_go_forward,
+                                      gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    if (self->priv->can_go_back != (gboolean) can_go_back) {
+        self->priv->can_go_back = can_go_back;
+        g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_CAN_GO_BACK]);
+    }
+
+    if (self->priv->can_go_forward != (gboolean) can_go_forward) {
+        self->priv->can_go_forward = can_go_forward;
+        g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_CAN_GO_FORWARD]);
+    }
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -146,6 +264,22 @@ servo_gtk_web_view_get_property(GObject    *object,
         g_value_set_string(value, self->uri);
         break;
 
+    case PROP_TITLE:
+        g_value_set_string(value, self->priv->title);
+        break;
+
+    case PROP_IS_LOADING:
+        g_value_set_boolean(value, self->priv->is_loading);
+        break;
+
+    case PROP_CAN_GO_BACK:
+        g_value_set_boolean(value, self->priv->can_go_back);
+        break;
+
+    case PROP_CAN_GO_FORWARD:
+        g_value_set_boolean(value, self->priv->can_go_forward);
+        break;
+
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -178,6 +312,8 @@ servo_gtk_web_view_finalize(GObject *object)
     ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(object);
 
     g_clear_pointer(&self->uri, g_free);
+    g_clear_pointer(&self->priv->title, g_free);
+    g_clear_pointer(&self->priv, g_free);
 
     G_OBJECT_CLASS(servo_gtk_web_view_parent_class)->finalize(object);
 }
@@ -256,6 +392,12 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
                 self->servo, servo_gtk_web_view_on_cursor_changed, self);
             servo_webview_set_url_changed_callback(
                 self->servo, servo_gtk_web_view_on_url_changed, self);
+            servo_webview_set_title_changed_callback(
+                self->servo, servo_gtk_web_view_on_title_changed, self);
+            servo_webview_set_load_status_changed_callback(
+                self->servo, servo_gtk_web_view_on_load_status_changed, self);
+            servo_webview_set_history_changed_callback(
+                self->servo, servo_gtk_web_view_on_history_changed, self);
         }
     } else {
         servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
@@ -561,6 +703,42 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
         );
 
+    properties[PROP_TITLE] =
+        g_param_spec_string(
+            "title",
+            "Title",
+            "The title of the loaded page",
+            NULL,
+            G_PARAM_READABLE | G_PARAM_STATIC_STRINGS
+        );
+
+    properties[PROP_IS_LOADING] =
+        g_param_spec_boolean(
+            "is-loading",
+            "Is loading",
+            "Whether a load is currently in progress",
+            FALSE,
+            G_PARAM_READABLE | G_PARAM_STATIC_STRINGS
+        );
+
+    properties[PROP_CAN_GO_BACK] =
+        g_param_spec_boolean(
+            "can-go-back",
+            "Can go back",
+            "Whether there is a previous entry in the session history",
+            FALSE,
+            G_PARAM_READABLE | G_PARAM_STATIC_STRINGS
+        );
+
+    properties[PROP_CAN_GO_FORWARD] =
+        g_param_spec_boolean(
+            "can-go-forward",
+            "Can go forward",
+            "Whether there is a following entry in the session history",
+            FALSE,
+            G_PARAM_READABLE | G_PARAM_STATIC_STRINGS
+        );
+
     g_object_class_install_properties(object_class, N_PROPERTIES, properties);
 
     /**
@@ -583,12 +761,37 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             1,
             G_TYPE_STRING
         );
+
+    /**
+     * ServoGtkWebView::load-changed:
+     * @self: the #ServoGtkWebView
+     * @load_event: the stage the load has reached
+     *
+     * Emitted as a load progresses: once with %SERVO_GTK_LOAD_STARTED, once
+     * with %SERVO_GTK_LOAD_COMMITTED when the document body becomes reachable,
+     * and once with %SERVO_GTK_LOAD_FINISHED when the page and all of its
+     * subresources have loaded.
+     */
+    signals[LOAD_CHANGED] =
+        g_signal_new(
+            "load-changed",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_FIRST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, load_changed),
+            NULL, NULL, /* accumulator */
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_NONE,
+            1,
+            SERVO_GTK_TYPE_LOAD_EVENT
+        );
 }
 
 static void
 servo_gtk_web_view_init(ServoGtkWebView *self)
 {
     GtkWidget *widget = GTK_WIDGET(self);
+
+    self->priv = g_new0(ServoGtkWebViewPrivate, 1);
 
     gtk_widget_set_focusable(widget, TRUE);
 
@@ -664,6 +867,38 @@ servo_gtk_web_view_get_uri(ServoGtkWebView *self)
     g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), NULL);
 
     return self->uri;
+}
+
+const gchar *
+servo_gtk_web_view_get_title(ServoGtkWebView *self)
+{
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), NULL);
+
+    return self->priv->title;
+}
+
+gboolean
+servo_gtk_web_view_is_loading(ServoGtkWebView *self)
+{
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), FALSE);
+
+    return self->priv->is_loading;
+}
+
+gboolean
+servo_gtk_web_view_can_go_back(ServoGtkWebView *self)
+{
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), FALSE);
+
+    return self->priv->can_go_back;
+}
+
+gboolean
+servo_gtk_web_view_can_go_forward(ServoGtkWebView *self)
+{
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), FALSE);
+
+    return self->priv->can_go_forward;
 }
 
 /*

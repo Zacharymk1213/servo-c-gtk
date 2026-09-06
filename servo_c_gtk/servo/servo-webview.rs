@@ -29,7 +29,7 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    Key, KeyState, KeyboardEvent, Location, Modifiers, MouseButton, MouseButtonAction,
+    Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, PrefValue, Preferences, RenderingContext, Scroll,
     Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
     WebViewPoint, WebViewVector,
@@ -56,6 +56,21 @@ pub type ServoCursorChangedCallback =
 pub type ServoUrlChangedCallback =
     extern "C" fn(url: *const c_char, user_data: *mut c_void);
 
+/// Called when the page title changes. `title` is a NUL-terminated UTF-8
+/// string valid only for the duration of the call, or NULL when the page has
+/// no title (a fresh navigation clears it).
+pub type ServoTitleChangedCallback =
+    extern "C" fn(title: *const c_char, user_data: *mut c_void);
+
+/// Called when the load progresses. `status` is a `servo_load_status` value
+/// mirroring the `SERVO_LOAD_STATUS_*` constants in `servo-webview.h`.
+pub type ServoLoadStatusChangedCallback = extern "C" fn(status: u32, user_data: *mut c_void);
+
+/// Called when the session history changes, with the new availability of the
+/// back and forward entries. Fires on navigation and on history traversal.
+pub type ServoHistoryChangedCallback =
+    extern "C" fn(can_go_back: bool, can_go_forward: bool, user_data: *mut c_void);
+
 struct FrameCallback {
     func: ServoFrameReadyCallback,
     user_data: *mut c_void,
@@ -71,6 +86,21 @@ struct UrlCallback {
     user_data: *mut c_void,
 }
 
+struct TitleCallback {
+    func: ServoTitleChangedCallback,
+    user_data: *mut c_void,
+}
+
+struct LoadStatusCallback {
+    func: ServoLoadStatusChangedCallback,
+    user_data: *mut c_void,
+}
+
+struct HistoryCallback {
+    func: ServoHistoryChangedCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -78,6 +108,9 @@ struct EmbedderDelegate {
     frame_callback: RefCell<Option<FrameCallback>>,
     cursor_callback: RefCell<Option<CursorCallback>>,
     url_callback: RefCell<Option<UrlCallback>>,
+    title_callback: RefCell<Option<TitleCallback>>,
+    load_status_callback: RefCell<Option<LoadStatusCallback>>,
+    history_callback: RefCell<Option<HistoryCallback>>,
 }
 
 impl EmbedderDelegate {
@@ -87,6 +120,9 @@ impl EmbedderDelegate {
             frame_callback: RefCell::new(None),
             cursor_callback: RefCell::new(None),
             url_callback: RefCell::new(None),
+            title_callback: RefCell::new(None),
+            load_status_callback: RefCell::new(None),
+            history_callback: RefCell::new(None),
         }
     }
 }
@@ -143,6 +179,58 @@ impl WebViewDelegate for EmbedderDelegate {
         if let Ok(url) = CString::new(url.as_str()) {
             (cb.0)(url.as_ptr(), cb.1);
         }
+    }
+
+    fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
+        let Some(cb) = self.title_callback.borrow().as_ref().map(|c| (c.func, c.user_data))
+        else {
+            return;
+        };
+        // A title with an interior NUL cannot cross the C boundary; report it
+        // the same way as no title at all rather than dropping the event.
+        match title.and_then(|title| CString::new(title).ok()) {
+            Some(title) => (cb.0)(title.as_ptr(), cb.1),
+            None => (cb.0)(ptr::null(), cb.1),
+        }
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        let Some(cb) = self
+            .load_status_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data))
+        else {
+            return;
+        };
+        (cb.0)(load_status_to_abi(status), cb.1);
+    }
+
+    fn notify_history_changed(&self, webview: WebView, _entries: Vec<Url>, _current: usize) {
+        let Some(cb) = self.history_callback.borrow().as_ref().map(|c| (c.func, c.user_data))
+        else {
+            return;
+        };
+        // Servo updates the webview's back/forward list before invoking the
+        // delegate, so querying it here reports the post-change state.
+        (cb.0)(webview.can_go_back(), webview.can_go_forward(), cb.1);
+    }
+}
+
+/// Load-progress values understood by the C ABI. Mirrors the
+/// `SERVO_LOAD_STATUS_*` constants in `servo-webview.h` — keep the two in sync.
+mod servo_load_status {
+    pub const STARTED: u32 = 0;
+    pub const HEAD_PARSED: u32 = 1;
+    pub const COMPLETE: u32 = 2;
+}
+
+/// Map a Servo [`LoadStatus`] to its `servo_load_status` ABI value.
+fn load_status_to_abi(status: LoadStatus) -> u32 {
+    match status {
+        LoadStatus::Started => servo_load_status::STARTED,
+        LoadStatus::HeadParsed => servo_load_status::HEAD_PARSED,
+        LoadStatus::Complete => servo_load_status::COMPLETE,
     }
 }
 
@@ -414,6 +502,64 @@ pub unsafe extern "C" fn servo_webview_set_url_changed_callback(
     };
     *handle.delegate.url_callback.borrow_mut() =
         callback.map(|func| UrlCallback { func, user_data });
+}
+
+/// Register the page-title callback, invoked whenever the title changes. Pass a
+/// NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_title_changed_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoTitleChangedCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.title_callback.borrow_mut() =
+        callback.map(|func| TitleCallback { func, user_data });
+}
+
+/// Register the load-status callback, invoked as a load starts, has its `<head>`
+/// parsed, and completes. Pass a NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_load_status_changed_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoLoadStatusChangedCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.load_status_callback.borrow_mut() =
+        callback.map(|func| LoadStatusCallback { func, user_data });
+}
+
+/// Register the history-change callback, invoked whenever the session history
+/// changes with the new availability of the back and forward entries. Pass a
+/// NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_history_changed_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoHistoryChangedCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.history_callback.borrow_mut() =
+        callback.map(|func| HistoryCallback { func, user_data });
 }
 
 /// Begin loading `uri`. Invalid URLs are ignored.
@@ -752,6 +898,60 @@ pub unsafe extern "C" fn servo_webview_get_uri(
         },
         None => ptr::null_mut(),
     }
+}
+
+/// Return the current page title as a newly-allocated UTF-8 C string, or NULL
+/// if the page has no title. Free the result with [`servo_string_free`].
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_get_title(
+    webview: *mut ServoWebViewHandle,
+) -> *mut c_char {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return ptr::null_mut();
+    };
+    match handle.webview.page_title() {
+        Some(title) => match CString::new(title) {
+            Ok(cstring) => cstring.into_raw(),
+            Err(_) => ptr::null_mut(),
+        },
+        None => ptr::null_mut(),
+    }
+}
+
+/// Return the current load status as a `SERVO_LOAD_STATUS_*` value. An invalid
+/// handle reports `SERVO_LOAD_STATUS_COMPLETE` (nothing is loading).
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_get_load_status(
+    webview: *mut ServoWebViewHandle,
+) -> u32 {
+    match unsafe { as_handle(webview) } {
+        Some(handle) => load_status_to_abi(handle.webview.load_status()),
+        None => servo_load_status::COMPLETE,
+    }
+}
+
+/// Whether there is a previous entry in the session history to go back to.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_can_go_back(webview: *mut ServoWebViewHandle) -> bool {
+    unsafe { as_handle(webview) }.is_some_and(|handle| handle.webview.can_go_back())
+}
+
+/// Whether there is a following entry in the session history to go forward to.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_can_go_forward(webview: *mut ServoWebViewHandle) -> bool {
+    unsafe { as_handle(webview) }.is_some_and(|handle| handle.webview.can_go_forward())
 }
 
 /// Free a string previously returned by this library (e.g.
