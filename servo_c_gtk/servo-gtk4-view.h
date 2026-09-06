@@ -35,6 +35,27 @@ typedef enum {
 
 GType servo_gtk_load_event_get_type (void) G_GNUC_CONST;
 
+/**
+ * ServoGtkScriptDialogType:
+ * @SERVO_GTK_SCRIPT_DIALOG_ALERT: an `alert()`: a message and a single button
+ * @SERVO_GTK_SCRIPT_DIALOG_CONFIRM: a `confirm()`: a message with accept and
+ *   cancel buttons
+ * @SERVO_GTK_SCRIPT_DIALOG_PROMPT: a `prompt()`: a message, a text entry
+ *   prefilled with the page's default, and accept and cancel buttons
+ *
+ * The kind of dialog web content opened, as reported by
+ * #ServoGtkWebView::script-dialog.
+ */
+typedef enum {
+    SERVO_GTK_SCRIPT_DIALOG_ALERT,
+    SERVO_GTK_SCRIPT_DIALOG_CONFIRM,
+    SERVO_GTK_SCRIPT_DIALOG_PROMPT
+} ServoGtkScriptDialogType;
+
+#define SERVO_GTK_TYPE_SCRIPT_DIALOG_TYPE      (servo_gtk_script_dialog_type_get_type ())
+
+GType servo_gtk_script_dialog_type_get_type (void) G_GNUC_CONST;
+
 typedef struct _ServoGtkWebView              ServoGtkWebView;
 typedef struct _ServoGtkWebViewPrivate       ServoGtkWebViewPrivate;
 typedef struct _ServoGtkWebViewClass         ServoGtkWebViewClass;
@@ -64,11 +85,16 @@ struct _ServoGtkWebViewClass {
                          const gchar     *uri);
     void (*load_changed) (ServoGtkWebView   *web_view,
                           ServoGtkLoadEvent  load_event);
+    gboolean (*script_dialog) (ServoGtkWebView          *web_view,
+                               ServoGtkScriptDialogType  dialog_type,
+                               const gchar              *message,
+                               const gchar              *default_value,
+                               guint64                   request_id);
+    void (*script_dialog_cancelled) (ServoGtkWebView *web_view,
+                                     guint64          request_id);
 
     /* Padding for future expansion */
     void (*_gtk_reserved1) (void);
-    void (*_gtk_reserved2) (void);
-    void (*_gtk_reserved3) (void);
 };
 
 /**
@@ -164,6 +190,28 @@ void servo_gtk_web_view_set_zoom_level(ServoGtkWebView *self, gdouble zoom_level
  * Returns: the current zoom level, where 1.0 is unzoomed
  */
 gdouble servo_gtk_web_view_get_zoom_level(ServoGtkWebView *self);
+
+/**
+ * servo_gtk_web_view_respond_to_dialog:
+ * @self: a #ServoGtkWebView
+ * @request_id: the id from the #ServoGtkWebView::script-dialog emission
+ * @accepted: %TRUE if the user accepted the dialog, %FALSE if they cancelled
+ * @text: (nullable): for a %SERVO_GTK_SCRIPT_DIALOG_PROMPT, the text the user
+ *   entered; %NULL keeps the page's default. Ignored for other dialog types.
+ *
+ * Answers a dialog reported by #ServoGtkWebView::script-dialog. Only needed by
+ * a handler that returned %TRUE to present its own dialog — the built-in one
+ * answers on its own.
+ *
+ * The page's script is blocked until a dialog is answered, so every handled
+ * dialog must eventually be answered. Answering a @request_id that has already
+ * been answered, or that Servo withdrew (see
+ * #ServoGtkWebView::script-dialog-cancelled), does nothing.
+ */
+void servo_gtk_web_view_respond_to_dialog(ServoGtkWebView *self,
+                                          guint64          request_id,
+                                          gboolean         accepted,
+                                          const gchar     *text);
 
 /**
  * servo_gtk_web_view_reload:

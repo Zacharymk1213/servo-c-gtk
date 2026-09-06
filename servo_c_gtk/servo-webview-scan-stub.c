@@ -76,6 +76,31 @@ servo_webview_set_history_changed_callback(ServoWebViewHandle         *webview,
     (void) webview; (void) callback; (void) user_data;
 }
 
+void
+servo_webview_set_dialog_callback(ServoWebViewHandle *webview,
+                                  ServoDialogCallback callback,
+                                  void               *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_set_request_cancelled_callback(ServoWebViewHandle           *webview,
+                                             ServoRequestCancelledCallback callback,
+                                             void                         *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_dialog_respond(ServoWebViewHandle *webview,
+                             uint64_t            request_id,
+                             bool                accepted,
+                             const char         *text)
+{
+    (void) webview; (void) request_id; (void) accepted; (void) text;
+}
+
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 {
     (void) webview; (void) uri;

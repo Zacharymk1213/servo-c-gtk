@@ -20,6 +20,8 @@ static GParamSpec *properties[N_PROPERTIES] = { NULL };
 enum {
     URI_CHANGED,
     LOAD_CHANGED,
+    SCRIPT_DIALOG,
+    SCRIPT_DIALOG_CANCELLED,
     N_SIGNALS
 };
 
@@ -40,6 +42,12 @@ struct _ServoGtkWebViewPrivate {
      * before the widget is allocated and Servo exists.
      */
     gdouble   zoom_level;
+    /*
+     * Dialog windows the built-in handler put up, keyed by request id, so a
+     * dialog Servo withdraws can be taken back down. Values are unowned: each
+     * window removes itself from here when it is destroyed.
+     */
+    GHashTable *dialogs;
 };
 
 /*
@@ -59,6 +67,32 @@ servo_gtk_load_event_get_type(void)
             { 0, NULL, NULL }
         };
         GType id = g_enum_register_static("ServoGtkLoadEvent", values);
+        g_once_init_leave(&type_id, id);
+    }
+
+    return (GType) type_id;
+}
+
+/*
+ * Register ServoGtkScriptDialogType as a GType so the ::script-dialog signal
+ * carries a proper enumeration rather than a bare integer.
+ */
+GType
+servo_gtk_script_dialog_type_get_type(void)
+{
+    static gsize type_id = 0;
+
+    if (g_once_init_enter(&type_id)) {
+        static const GEnumValue values[] = {
+            { SERVO_GTK_SCRIPT_DIALOG_ALERT,
+              "SERVO_GTK_SCRIPT_DIALOG_ALERT",   "alert" },
+            { SERVO_GTK_SCRIPT_DIALOG_CONFIRM,
+              "SERVO_GTK_SCRIPT_DIALOG_CONFIRM", "confirm" },
+            { SERVO_GTK_SCRIPT_DIALOG_PROMPT,
+              "SERVO_GTK_SCRIPT_DIALOG_PROMPT",  "prompt" },
+            { 0, NULL, NULL }
+        };
+        GType id = g_enum_register_static("ServoGtkScriptDialogType", values);
         g_once_init_leave(&type_id, id);
     }
 
@@ -226,6 +260,210 @@ servo_gtk_web_view_on_history_changed(bool     can_go_back,
     }
 }
 
+/* ------------------------------------------------------------------ *
+ * Built-in script dialog
+ *
+ * Servo blocks the page's script until a dialog is answered, so the window
+ * below must answer exactly once no matter how it goes away: the buttons
+ * answer, and ::destroy answers with "cancelled" for a window closed through
+ * the window manager or torn down with the widget.
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    ServoGtkWebView *web_view;    /* holds a reference */
+    GtkWidget       *entry;       /* unowned; NULL unless this is a prompt */
+    guint64          request_id;
+    gboolean         responded;
+} ScriptDialogClosure;
+
+static void
+script_dialog_closure_free(gpointer data)
+{
+    ScriptDialogClosure *closure = data;
+
+    g_object_unref(closure->web_view);
+    g_free(closure);
+}
+
+/* Answer the dialog this window is showing, at most once. */
+static void
+script_dialog_respond(GtkWidget *window, gboolean accepted)
+{
+    ScriptDialogClosure *closure =
+        g_object_get_data(G_OBJECT(window), "servo-gtk-script-dialog");
+    const gchar *text = NULL;
+
+    if (closure == NULL || closure->responded) {
+        return;
+    }
+    closure->responded = TRUE;
+
+    if (closure->entry != NULL) {
+        text = gtk_entry_get_text(GTK_ENTRY(closure->entry));
+    }
+
+    servo_gtk_web_view_respond_to_dialog(
+        closure->web_view, closure->request_id, accepted, text);
+}
+
+/* Take a dialog window down; ::destroy cancels it if it is still unanswered. */
+static void
+servo_gtk_web_view_destroy_dialog(GtkWidget *window)
+{
+    gtk_widget_destroy(window);
+}
+
+static void
+on_script_dialog_destroy(GtkWidget *window, gpointer user_data)
+{
+    (void) user_data;
+
+    script_dialog_respond(window, FALSE);
+}
+
+static void
+on_script_dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data)
+{
+    (void) user_data;
+
+    script_dialog_respond(GTK_WIDGET(dialog), response_id == GTK_RESPONSE_OK);
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+/*
+ * Class closure for ::script-dialog: present the dialog ourselves. Runs only
+ * when no handler claimed the dialog by returning TRUE.
+ */
+static gboolean
+servo_gtk_web_view_default_script_dialog(ServoGtkWebView          *self,
+                                         ServoGtkScriptDialogType  dialog_type,
+                                         const gchar              *message,
+                                         const gchar              *default_value,
+                                         guint64                   request_id)
+{
+    ScriptDialogClosure *closure;
+    GtkWidget           *dialog;
+    GtkWidget           *content;
+    GtkWidget           *label;
+    GtkWidget           *toplevel;
+    guint64             *key;
+
+    dialog = gtk_dialog_new();
+    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+    /*
+     * The text is page-controlled, so the window is titled generically and the
+     * message is shown as a plain, non-markup label: content must not be able
+     * to dress its dialog up as browser UI.
+     */
+    gtk_window_set_title(GTK_WINDOW(dialog), "JavaScript");
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(self));
+    if (toplevel != NULL && gtk_widget_is_toplevel(toplevel)) {
+        gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(toplevel));
+    }
+
+    /* alert() has a single button; confirm() and prompt() can be cancelled. */
+    if (dialog_type != SERVO_GTK_SCRIPT_DIALOG_ALERT) {
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "_Cancel", GTK_RESPONSE_CANCEL);
+    }
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "_OK", GTK_RESPONSE_OK);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_box_set_spacing(GTK_BOX(content), 12);
+    gtk_widget_set_margin_start(content, 18);
+    gtk_widget_set_margin_end(content, 18);
+    gtk_widget_set_margin_top(content, 18);
+    gtk_widget_set_margin_bottom(content, 18);
+
+    label = gtk_label_new(message != NULL ? message : "");
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 60);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 0);
+
+    closure = g_new0(ScriptDialogClosure, 1);
+    closure->web_view = g_object_ref(self);
+    closure->request_id = request_id;
+
+    if (dialog_type == SERVO_GTK_SCRIPT_DIALOG_PROMPT) {
+        closure->entry = gtk_entry_new();
+        gtk_entry_set_text(GTK_ENTRY(closure->entry),
+                           default_value != NULL ? default_value : "");
+        gtk_entry_set_activates_default(GTK_ENTRY(closure->entry), TRUE);
+        gtk_box_pack_start(GTK_BOX(content), closure->entry, FALSE, FALSE, 0);
+    }
+
+    g_object_set_data_full(G_OBJECT(dialog), "servo-gtk-script-dialog",
+                           closure, script_dialog_closure_free);
+
+    g_signal_connect(dialog, "response", G_CALLBACK(on_script_dialog_response), NULL);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(on_script_dialog_destroy), NULL);
+
+    key = g_new(guint64, 1);
+    *key = request_id;
+    g_hash_table_insert(self->priv->dialogs, key, dialog);
+
+    gtk_widget_show_all(dialog);
+    if (closure->entry != NULL) {
+        gtk_widget_grab_focus(closure->entry);
+    }
+
+    return TRUE;
+}
+
+/*
+ * Web content opened alert()/confirm()/prompt(). Servo blocks the page's script
+ * until the dialog is answered, so this only reports it; the answer travels
+ * back later through servo_gtk_web_view_respond_to_dialog(). Emitting the
+ * signal runs the built-in dialog as the class closure unless a handler
+ * returns TRUE to present its own.
+ */
+static void
+servo_gtk_web_view_on_dialog(guint64     request_id,
+                             guint32     dialog_type,
+                             const char *message,
+                             const char *default_value,
+                             gpointer    user_data)
+{
+    ServoGtkWebView         *self = SERVO_GTK_WEB_VIEW(user_data);
+    ServoGtkScriptDialogType type;
+    gboolean                 handled = FALSE;
+
+    switch (dialog_type) {
+    case SERVO_DIALOG_ALERT:   type = SERVO_GTK_SCRIPT_DIALOG_ALERT; break;
+    case SERVO_DIALOG_CONFIRM: type = SERVO_GTK_SCRIPT_DIALOG_CONFIRM; break;
+    case SERVO_DIALOG_PROMPT:  type = SERVO_GTK_SCRIPT_DIALOG_PROMPT; break;
+    default:
+        /* An unknown dialog kind from a newer library: cancel rather than guess. */
+        servo_gtk_web_view_respond_to_dialog(self, request_id, FALSE, NULL);
+        return;
+    }
+
+    g_signal_emit(self, signals[SCRIPT_DIALOG], 0,
+                  type, message, default_value, request_id, &handled);
+}
+
+/*
+ * Servo withdrew a dialog before it was answered (the page navigated away).
+ * Take down the built-in window if it is the one showing, and tell handlers
+ * that took the dialog over.
+ */
+static void
+servo_gtk_web_view_on_request_cancelled(guint64 request_id, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    GtkWidget       *window =
+        g_hash_table_lookup(self->priv->dialogs, &request_id);
+
+    if (window != NULL) {
+        servo_gtk_web_view_destroy_dialog(window);
+    }
+
+    g_signal_emit(self, signals[SCRIPT_DIALOG_CANCELLED], 0, request_id);
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -318,6 +556,20 @@ servo_gtk_web_view_dispose(GObject *object)
 
     g_clear_object(&self->frame);
 
+    /*
+     * Take down any dialog still on screen before Servo goes away. Each window
+     * cancels its request as it is destroyed, which removes it from the table,
+     * so iterate over a snapshot of the values rather than the live table.
+     */
+    if (self->priv != NULL && self->priv->dialogs != NULL) {
+        GList *windows = g_hash_table_get_values(self->priv->dialogs);
+
+        for (GList *item = windows; item != NULL; item = item->next) {
+            servo_gtk_web_view_destroy_dialog(GTK_WIDGET(item->data));
+        }
+        g_list_free(windows);
+    }
+
     if (self->servo != NULL) {
         servo_webview_free(self->servo);
         self->servo = NULL;
@@ -333,6 +585,7 @@ servo_gtk_web_view_finalize(GObject *object)
 
     g_clear_pointer(&self->uri, g_free);
     g_clear_pointer(&self->priv->title, g_free);
+    g_clear_pointer(&self->priv->dialogs, g_hash_table_unref);
     g_clear_pointer(&self->priv, g_free);
 
     G_OBJECT_CLASS(servo_gtk_web_view_parent_class)->finalize(object);
@@ -415,6 +668,10 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
                 self->servo, servo_gtk_web_view_on_load_status_changed, self);
             servo_webview_set_history_changed_callback(
                 self->servo, servo_gtk_web_view_on_history_changed, self);
+            servo_webview_set_dialog_callback(
+                self->servo, servo_gtk_web_view_on_dialog, self);
+            servo_webview_set_request_cancelled_callback(
+                self->servo, servo_gtk_web_view_on_request_cancelled, self);
         }
     } else {
         servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
@@ -675,6 +932,8 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
     object_class->dispose = servo_gtk_web_view_dispose;
     object_class->finalize = servo_gtk_web_view_finalize;
 
+    klass->script_dialog = servo_gtk_web_view_default_script_dialog;
+
     widget_class->draw = servo_gtk_web_view_draw;
     widget_class->size_allocate = servo_gtk_web_view_size_allocate;
     widget_class->motion_notify_event = servo_gtk_web_view_motion_notify;
@@ -783,6 +1042,67 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             1,
             SERVO_GTK_TYPE_LOAD_EVENT
         );
+
+    /**
+     * ServoGtkWebView::script-dialog:
+     * @self: the #ServoGtkWebView
+     * @dialog_type: which of alert(), confirm() or prompt() the page called
+     * @message: the message the page supplied
+     * @default_value: (nullable): a prompt's initial text, %NULL otherwise
+     * @request_id: identifies this dialog when answering it
+     *
+     * Emitted when web content opens a dialog. The default handler presents a
+     * modal window and answers the dialog itself.
+     *
+     * Return %TRUE from a handler to present your own dialog instead; you must
+     * then call servo_gtk_web_view_respond_to_dialog() with @request_id when
+     * the user answers, since the page's script stays blocked until you do.
+     * Watch #ServoGtkWebView::script-dialog-cancelled in case Servo withdraws
+     * the dialog first.
+     *
+     * @message and @default_value are controlled by the page, so a dialog must
+     * be presented in a way that cannot be mistaken for browser UI.
+     *
+     * Returns: %TRUE to stop the built-in dialog from being shown
+     */
+    signals[SCRIPT_DIALOG] =
+        g_signal_new(
+            "script-dialog",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, script_dialog),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            4,
+            SERVO_GTK_TYPE_SCRIPT_DIALOG_TYPE,
+            G_TYPE_STRING,
+            G_TYPE_STRING,
+            G_TYPE_UINT64
+        );
+
+    /**
+     * ServoGtkWebView::script-dialog-cancelled:
+     * @self: the #ServoGtkWebView
+     * @request_id: the dialog Servo withdrew
+     *
+     * Emitted when Servo withdraws a dialog that has not been answered, for
+     * instance because the page navigated away. A handler that took the dialog
+     * over should take its window down; answering @request_id afterwards is
+     * harmless but does nothing.
+     */
+    signals[SCRIPT_DIALOG_CANCELLED] =
+        g_signal_new(
+            "script-dialog-cancelled",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_FIRST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, script_dialog_cancelled),
+            NULL, NULL, /* accumulator */
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_NONE,
+            1,
+            G_TYPE_UINT64
+        );
 }
 
 static void
@@ -792,6 +1112,8 @@ servo_gtk_web_view_init(ServoGtkWebView *self)
 
     self->priv = g_new0(ServoGtkWebViewPrivate, 1);
     self->priv->zoom_level = 1.0;
+    self->priv->dialogs =
+        g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
 
     gtk_widget_set_can_focus(widget, TRUE);
 
@@ -907,6 +1229,21 @@ servo_gtk_web_view_get_zoom_level(ServoGtkWebView *self)
     g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), 1.0);
 
     return self->priv->zoom_level;
+}
+
+void
+servo_gtk_web_view_respond_to_dialog(ServoGtkWebView *self,
+                                     guint64          request_id,
+                                     gboolean         accepted,
+                                     const gchar     *text)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    g_hash_table_remove(self->priv->dialogs, &request_id);
+
+    if (self->servo != NULL) {
+        servo_webview_dialog_respond(self->servo, request_id, accepted, text);
+    }
 }
 
 /*

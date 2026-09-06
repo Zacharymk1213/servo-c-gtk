@@ -20,7 +20,8 @@
 //!    the frame-ready callback fires synchronously from inside this call.
 //! 5. `servo_webview_free()` — destroy the handle.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::rc::Rc;
@@ -29,10 +30,11 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, NamedKey, PrefValue, Preferences, RenderingContext, Scroll,
-    Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
-    WebViewPoint, WebViewVector,
+    EmbedderControl, EmbedderControlId, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
+    PrefValue, Preferences, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
+    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    WebViewVector,
 };
 use url::Url;
 
@@ -71,6 +73,106 @@ pub type ServoLoadStatusChangedCallback = extern "C" fn(status: u32, user_data: 
 pub type ServoHistoryChangedCallback =
     extern "C" fn(can_go_back: bool, can_go_forward: bool, user_data: *mut c_void);
 
+/// Called when web content opens a [simple dialog][spec] — `alert()`,
+/// `confirm()` or `prompt()`.
+///
+/// The dialog is *not* answered when this returns: the host shows its own UI
+/// and later calls [`servo_webview_dialog_respond`] with `request_id`. Until
+/// then the page's script is blocked. `message` is content-controlled text,
+/// valid only for the duration of the call; `default_value` is the prompt's
+/// initial text and is NULL for alerts and confirms.
+///
+/// [spec]: https://html.spec.whatwg.org/multipage/#simple-dialogs
+pub type ServoDialogCallback = extern "C" fn(
+    request_id: u64,
+    dialog_type: u32,
+    message: *const c_char,
+    default_value: *const c_char,
+    user_data: *mut c_void,
+);
+
+/// Called when Servo withdraws a request the host has not answered yet — the
+/// page navigated away, or the element went out of the document. The host
+/// should take down whatever UI it put up for `request_id`; responding to it
+/// afterwards is harmless and does nothing.
+pub type ServoRequestCancelledCallback =
+    extern "C" fn(request_id: u64, user_data: *mut c_void);
+
+/// Dialog kinds passed to a [`ServoDialogCallback`]. Mirrors the
+/// `SERVO_DIALOG_*` constants in `servo-webview.h` — keep the two in sync.
+mod servo_dialog {
+    pub const ALERT: u32 = 0;
+    pub const CONFIRM: u32 = 1;
+    pub const PROMPT: u32 = 2;
+}
+
+/// A request Servo has handed to the embedder and is waiting on an answer for.
+///
+/// Each variant owns the Servo-side request object. Dropping one without an
+/// explicit answer is safe: every one of these types answers with its
+/// conservative default from `Drop` (dismiss/cancel), so tearing the handle
+/// down while dialogs are open never leaves script blocked forever.
+enum PendingRequest {
+    SimpleDialog(SimpleDialog),
+}
+
+/// A [`PendingRequest`] plus the engine-side id it arrived with, which is what
+/// `hide_embedder_control` names when Servo withdraws it.
+struct Pending {
+    control_id: EmbedderControlId,
+    request: PendingRequest,
+}
+
+/// The requests currently awaiting an answer from the host, keyed by the id
+/// handed out to C.
+///
+/// `EmbedderControlId` is only `PartialEq`, not `Hash`, so withdrawal scans for
+/// a matching id rather than looking it up. The map holds at most a couple of
+/// entries in practice — script blocks on a simple dialog, so a page cannot
+/// stack them up.
+#[derive(Default)]
+struct RequestRegistry {
+    requests: RefCell<HashMap<u64, Pending>>,
+    next_id: Cell<u64>,
+}
+
+impl RequestRegistry {
+    /// Store `request` and return the id C should use to answer it.
+    fn insert(&self, control_id: EmbedderControlId, request: PendingRequest) -> u64 {
+        let id = self.next_id.get().wrapping_add(1);
+        self.next_id.set(id);
+        self.requests.borrow_mut().insert(
+            id,
+            Pending {
+                control_id,
+                request,
+            },
+        );
+        id
+    }
+
+    /// Remove and return a request, or `None` if it was already answered or
+    /// withdrawn (a host answering twice, or answering a stale id).
+    fn take(&self, id: u64) -> Option<PendingRequest> {
+        self.requests
+            .borrow_mut()
+            .remove(&id)
+            .map(|pending| pending.request)
+    }
+
+    /// Remove the request carrying `control_id`, returning the id C knows it
+    /// by so the withdrawal can be reported.
+    fn take_by_control_id(&self, control_id: EmbedderControlId) -> Option<u64> {
+        let mut requests = self.requests.borrow_mut();
+        let id = requests
+            .iter()
+            .find(|(_, pending)| pending.control_id == control_id)
+            .map(|(id, _)| *id)?;
+        requests.remove(&id);
+        Some(id)
+    }
+}
+
 struct FrameCallback {
     func: ServoFrameReadyCallback,
     user_data: *mut c_void,
@@ -101,6 +203,16 @@ struct HistoryCallback {
     user_data: *mut c_void,
 }
 
+struct DialogCallback {
+    func: ServoDialogCallback,
+    user_data: *mut c_void,
+}
+
+struct RequestCancelledCallback {
+    func: ServoRequestCancelledCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -111,6 +223,9 @@ struct EmbedderDelegate {
     title_callback: RefCell<Option<TitleCallback>>,
     load_status_callback: RefCell<Option<LoadStatusCallback>>,
     history_callback: RefCell<Option<HistoryCallback>>,
+    dialog_callback: RefCell<Option<DialogCallback>>,
+    request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
+    requests: RequestRegistry,
 }
 
 impl EmbedderDelegate {
@@ -123,6 +238,9 @@ impl EmbedderDelegate {
             title_callback: RefCell::new(None),
             load_status_callback: RefCell::new(None),
             history_callback: RefCell::new(None),
+            dialog_callback: RefCell::new(None),
+            request_cancelled_callback: RefCell::new(None),
+            requests: RequestRegistry::default(),
         }
     }
 }
@@ -214,6 +332,81 @@ impl WebViewDelegate for EmbedderDelegate {
         // Servo updates the webview's back/forward list before invoking the
         // delegate, so querying it here reports the post-change state.
         (cb.0)(webview.can_go_back(), webview.can_go_forward(), cb.1);
+    }
+
+    fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
+        let control_id = embedder_control.id();
+
+        match embedder_control {
+            EmbedderControl::SimpleDialog(dialog) => self.show_simple_dialog(control_id, dialog),
+            // Select-element pickers, colour pickers and IME are not wired up
+            // yet. Dropping the control answers it with its default (dismissed
+            // / no selection) rather than leaving script waiting.
+            _ => {},
+        }
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
+        // Dropping the stored request answers it with its conservative default.
+        let Some(id) = self.requests.take_by_control_id(control_id) else {
+            return;
+        };
+
+        let cb = self
+            .request_cancelled_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        if let Some((func, user_data)) = cb {
+            func(id, user_data);
+        }
+    }
+}
+
+impl EmbedderDelegate {
+    /// Hand a script-initiated dialog to the host and keep it alive until the
+    /// host answers. With no dialog callback registered the dialog is dropped
+    /// here, which answers it (alert: OK, confirm/prompt: cancel) rather than
+    /// blocking the page's script forever.
+    fn show_simple_dialog(&self, control_id: EmbedderControlId, dialog: SimpleDialog) {
+        let cb = self
+            .dialog_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        let dialog_type = match dialog {
+            SimpleDialog::Alert(_) => servo_dialog::ALERT,
+            SimpleDialog::Confirm(_) => servo_dialog::CONFIRM,
+            SimpleDialog::Prompt(_) => servo_dialog::PROMPT,
+        };
+
+        // Both strings are content-controlled, so an interior NUL is possible;
+        // fall back to an empty string rather than dropping the dialog.
+        let message = CString::new(dialog.message()).unwrap_or_default();
+        let default_value = match &dialog {
+            SimpleDialog::Prompt(prompt) => {
+                Some(CString::new(prompt.current_value()).unwrap_or_default())
+            },
+            _ => None,
+        };
+
+        let id = self
+            .requests
+            .insert(control_id, PendingRequest::SimpleDialog(dialog));
+
+        func(
+            id,
+            dialog_type,
+            message.as_ptr(),
+            default_value
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr()),
+            user_data,
+        );
     }
 }
 
@@ -560,6 +753,97 @@ pub unsafe extern "C" fn servo_webview_set_history_changed_callback(
     };
     *handle.delegate.history_callback.borrow_mut() =
         callback.map(|func| HistoryCallback { func, user_data });
+}
+
+/// Register the dialog callback, invoked when web content calls `alert()`,
+/// `confirm()` or `prompt()`. Pass a NULL `callback` to clear it.
+///
+/// With no callback registered, dialogs are answered immediately with their
+/// default (alert: OK, confirm and prompt: cancel) so that script never blocks
+/// on UI that will not appear.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_dialog_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoDialogCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.dialog_callback.borrow_mut() =
+        callback.map(|func| DialogCallback { func, user_data });
+}
+
+/// Register the request-withdrawn callback, invoked when Servo takes back a
+/// request the host has not answered yet. Pass a NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_request_cancelled_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoRequestCancelledCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.request_cancelled_callback.borrow_mut() =
+        callback.map(|func| RequestCancelledCallback { func, user_data });
+}
+
+/// Answer a dialog previously reported through a [`ServoDialogCallback`].
+///
+/// `accepted` is whether the user pressed the affirmative button; it is ignored
+/// for alerts, which have only one. `text` is the prompt's entered text and is
+/// ignored for alerts and confirms; passing NULL keeps the default that was
+/// reported with the dialog.
+///
+/// An unknown `request_id` — one already answered, or withdrawn by Servo — is
+/// ignored, so a host racing a withdrawal against a click does not need to
+/// track which happened first.
+///
+/// # Safety
+/// `webview` must be a valid handle and `text` NULL or a valid NUL-terminated
+/// C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_dialog_respond(
+    webview: *mut ServoWebViewHandle,
+    request_id: u64,
+    accepted: bool,
+    text: *const c_char,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    let Some(PendingRequest::SimpleDialog(dialog)) = handle.delegate.requests.take(request_id)
+    else {
+        return;
+    };
+
+    if !accepted {
+        dialog.dismiss();
+        return;
+    }
+
+    // Only a prompt carries text back to the page; for the others `confirm()`
+    // is the whole answer.
+    match dialog {
+        SimpleDialog::Prompt(mut prompt) => {
+            if !text.is_null()
+                && let Ok(text) = unsafe { CStr::from_ptr(text) }.to_str()
+            {
+                prompt.set_current_value(text);
+            }
+            prompt.confirm();
+        },
+        dialog => dialog.confirm(),
+    }
 }
 
 /// Begin loading `uri`. Invalid URLs are ignored.

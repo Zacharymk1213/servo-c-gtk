@@ -44,7 +44,7 @@ on_script_result(ServoGtkWebView *web_view,
     if (error != NULL) {
         g_printerr("Script error: %s\n", error);
     } else {
-        g_print("Recolored h1 elements: %s\n", result_json != NULL ? result_json : "(null)");
+        g_print("Script result: %s\n", result_json != NULL ? result_json : "(null)");
     }
 }
 
@@ -178,6 +178,24 @@ on_zoom_reset_clicked(GtkButton *button, gpointer user_data)
     zoom_by(SERVO_GTK_WEB_VIEW(user_data), 0.0);
 }
 
+/*
+ * Exercise the built-in script dialogs: prompt() blocks the page's script until
+ * the dialog is answered, and the entered text comes back as the script result.
+ */
+static void
+on_dialog_test_clicked(GtkButton *button, gpointer user_data)
+{
+    ServoGtkWebView *web_view = SERVO_GTK_WEB_VIEW(user_data);
+
+    (void) button;
+
+    servo_gtk_web_view_evaluate_script(
+        web_view,
+        "prompt('What is your name?', 'world');",
+        on_script_result,
+        NULL);
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -191,6 +209,7 @@ activate(GtkApplication *app, gpointer user_data)
     GtkWidget  *zoom_out_button;
     GtkWidget  *zoom_in_button;
     GtkWidget  *zoom_reset_button;
+    GtkWidget  *dialog_button;
     GtkWidget  *url_entry;
     GtkWidget  *color_button;
     GtkWidget  *web_view;
@@ -262,6 +281,11 @@ activate(GtkApplication *app, gpointer user_data)
     gtk_widget_set_tooltip_text(zoom_in_button, "Zoom in");
     g_signal_connect(zoom_in_button, "clicked", G_CALLBACK(on_zoom_in_clicked), web_view);
     gtk_box_pack_start(GTK_BOX(url_bar), zoom_in_button, FALSE, FALSE, 0);
+
+    dialog_button = gtk_button_new_from_icon_name("dialog-question-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(dialog_button, "Run a prompt() in the page");
+    g_signal_connect(dialog_button, "clicked", G_CALLBACK(on_dialog_test_clicked), web_view);
+    gtk_box_pack_start(GTK_BOX(url_bar), dialog_button, FALSE, FALSE, 0);
 
     color_button = gtk_color_button_new();
     gtk_widget_set_tooltip_text(color_button, "Set the color of all <h1> headings");

@@ -79,6 +79,37 @@ typedef void (*ServoHistoryChangedCallback)(bool  can_go_back,
                                             bool  can_go_forward,
                                             void *user_data);
 
+/* Which of the script-initiated dialogs web content opened. */
+typedef enum {
+    SERVO_DIALOG_ALERT = 0,
+    SERVO_DIALOG_CONFIRM = 1,
+    SERVO_DIALOG_PROMPT = 2
+} ServoDialogType;
+
+/*
+ * Invoked when web content opens a simple dialog — alert(), confirm() or
+ * prompt(). The dialog is NOT answered when this returns: show your own UI and
+ * call servo_webview_dialog_respond() with `request_id` once the user answers.
+ * The page's script stays blocked until you do.
+ *
+ * `message` is page-controlled text, valid only for the duration of the call,
+ * so a dialog showing it must not be mistakable for browser UI.
+ * `default_value` is a prompt's initial text and is NULL for the other kinds.
+ */
+typedef void (*ServoDialogCallback)(uint64_t    request_id,
+                                    uint32_t    dialog_type,
+                                    const char *message,
+                                    const char *default_value,
+                                    void       *user_data);
+
+/*
+ * Invoked when Servo withdraws a request that has not been answered — the page
+ * navigated away, or the element left the document. Take down whatever UI is
+ * showing for `request_id`; responding to it afterwards does nothing.
+ */
+typedef void (*ServoRequestCancelledCallback)(uint64_t request_id,
+                                              void    *user_data);
+
 /*
  * Create a webview with an initial surface of width x height device pixels.
  * `initial_uri` is the URL to load on creation, or NULL to start on
@@ -115,6 +146,28 @@ void servo_webview_set_load_status_changed_callback(
 void servo_webview_set_history_changed_callback(ServoWebViewHandle         *webview,
                                                 ServoHistoryChangedCallback callback,
                                                 void                       *user_data);
+void servo_webview_set_dialog_callback(ServoWebViewHandle *webview,
+                                       ServoDialogCallback callback,
+                                       void               *user_data);
+void servo_webview_set_request_cancelled_callback(
+    ServoWebViewHandle           *webview,
+    ServoRequestCancelledCallback callback,
+    void                         *user_data);
+
+/*
+ * Answer a dialog reported through a ServoDialogCallback. `accepted` is whether
+ * the user pressed the affirmative button (ignored for alerts, which have only
+ * one). `text` is a prompt's entered text and is ignored for the other kinds;
+ * NULL keeps the default that came with the dialog.
+ *
+ * An unknown `request_id` — already answered, or withdrawn by Servo — is
+ * ignored, so a host racing a withdrawal against a click need not track which
+ * happened first.
+ */
+void servo_webview_dialog_respond(ServoWebViewHandle *webview,
+                                  uint64_t            request_id,
+                                  bool                accepted,
+                                  const char         *text);
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);
