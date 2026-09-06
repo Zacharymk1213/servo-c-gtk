@@ -30,15 +30,15 @@ use std::sync::Once;
 
 use euclid::{Point2D, Scale};
 use servo::{
-    Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    AuthenticationRequest, CompositionEvent, CompositionState, ContextMenu, ContextMenuAction,
-    ContextMenuItem, CreateNewWebViewRequest, EmbedderControl, EmbedderControlId, FilePicker,
-    ImeEvent, InputMethodControl, Key, KeyState, KeyboardEvent, LoadStatus, Location,
-    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
-    PermissionFeature, PermissionRequest, PrefValue, Preferences, RenderingContext, Scroll,
-    Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType, TouchId,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
-    WebViewVector,
+    AuthenticationRequest, Code, CompositionEvent, CompositionState, ConsoleLogLevel, ContextMenu,
+    ContextMenuAction, ContextMenuItem, CreateNewWebViewRequest, Cursor, DeviceIntRect,
+    DeviceVector2D, EmbedderControl, EmbedderControlId, FilePicker, ImeEvent, InputEvent,
+    InputMethodControl, JSValue, JavaScriptEvaluationError, Key, KeyState, KeyboardEvent,
+    LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseMoveEvent, NamedKey, PermissionFeature, PermissionRequest, PrefValue, Preferences,
+    RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
+    TouchEvent, TouchEventType, TouchId, UserContentManager, UserScript, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WebViewVector,
 };
 use url::Url;
 
@@ -191,6 +191,34 @@ pub type ServoCreateWebViewCallback =
 /// opened a popup closing it. The host should take down whatever window is
 /// showing this webview and free its handle.
 pub type ServoClosedCallback = extern "C" fn(user_data: *mut c_void);
+
+/// Console levels reported to a [`ServoConsoleMessageCallback`]. Mirrors the
+/// `SERVO_CONSOLE_*` constants in `servo-webview.h` — keep the two in sync.
+mod servo_console {
+    pub const LOG: u32 = 0;
+    pub const DEBUG: u32 = 1;
+    pub const INFO: u32 = 2;
+    pub const WARN: u32 = 3;
+    pub const ERROR: u32 = 4;
+    pub const TRACE: u32 = 5;
+}
+
+/// Map a Servo [`ConsoleLogLevel`] to its ABI value.
+fn console_level_to_abi(level: ConsoleLogLevel) -> u32 {
+    match level {
+        ConsoleLogLevel::Log => servo_console::LOG,
+        ConsoleLogLevel::Debug => servo_console::DEBUG,
+        ConsoleLogLevel::Info => servo_console::INFO,
+        ConsoleLogLevel::Warn => servo_console::WARN,
+        ConsoleLogLevel::Error => servo_console::ERROR,
+        ConsoleLogLevel::Trace => servo_console::TRACE,
+    }
+}
+
+/// Called when content logs to the console. `message` is valid only for the
+/// duration of the call.
+pub type ServoConsoleMessageCallback =
+    extern "C" fn(level: u32, message: *const c_char, user_data: *mut c_void);
 
 /// Called when the page focuses an editable field and an input method should be
 /// shown.
@@ -469,6 +497,11 @@ struct ClosedCallback {
     user_data: *mut c_void,
 }
 
+struct ConsoleMessageCallback {
+    func: ServoConsoleMessageCallback,
+    user_data: *mut c_void,
+}
+
 struct InputMethodCallback {
     func: ServoInputMethodCallback,
     user_data: *mut c_void,
@@ -496,6 +529,7 @@ struct EmbedderDelegate {
     context_menu_callback: RefCell<Option<ContextMenuCallback>>,
     create_webview_callback: RefCell<Option<CreateWebViewCallback>>,
     closed_callback: RefCell<Option<ClosedCallback>>,
+    console_message_callback: RefCell<Option<ConsoleMessageCallback>>,
     input_method_callback: RefCell<Option<InputMethodCallback>>,
     input_method_hidden_callback: RefCell<Option<InputMethodHiddenCallback>>,
     /// The input-method control currently showing, so the withdrawal that hides
@@ -523,6 +557,7 @@ impl EmbedderDelegate {
             context_menu_callback: RefCell::new(None),
             create_webview_callback: RefCell::new(None),
             closed_callback: RefCell::new(None),
+            console_message_callback: RefCell::new(None),
             input_method_callback: RefCell::new(None),
             input_method_hidden_callback: RefCell::new(None),
             input_method_control_id: Cell::new(None),
@@ -707,6 +742,22 @@ impl WebViewDelegate for EmbedderDelegate {
         // still here afterwards is dropped, which refuses the popup rather than
         // leaving window.open() waiting on an answer that will not come.
         drop(self.requests.take(id));
+    }
+
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        let cb = self
+            .console_message_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+        // Console text is page-controlled, so an interior NUL is possible.
+        let Ok(message) = CString::new(message) else {
+            return;
+        };
+        func(console_level_to_abi(level), message.as_ptr(), user_data);
     }
 
     fn notify_closed(&self, _webview: WebView) {
@@ -947,6 +998,10 @@ pub struct ServoWebViewHandle {
     servo: Servo,
     webview: WebView,
     delegate: Rc<EmbedderDelegate>,
+    /// Scripts injected into every page this webview loads. Created up front so
+    /// a script can be added before the first load, which is the only way to
+    /// have it run in that page.
+    user_content: UserContentManager,
     // Kept alive for as long as the webview lives; the delegate also holds a
     // type-erased clone of the same context.
     _rendering_context: Rc<SoftwareRenderingContext>,
@@ -1126,8 +1181,10 @@ pub unsafe extern "C" fn servo_webview_new(
         .build();
 
     let delegate = Rc::new(EmbedderDelegate::new(rendering_context.clone()));
+    let user_content = UserContentManager::new(&servo);
     let mut builder = WebViewBuilder::new(&servo, rendering_context.clone())
-        .delegate(delegate.clone());
+        .delegate(delegate.clone())
+        .user_content_manager(Rc::new(user_content.clone()));
     if let Some(url) = initial_url {
         builder = builder.url(url);
     }
@@ -1139,6 +1196,7 @@ pub unsafe extern "C" fn servo_webview_new(
         servo,
         webview,
         delegate,
+        user_content,
         _rendering_context: rendering_context,
     });
     Box::into_raw(handle)
@@ -1457,6 +1515,53 @@ pub unsafe extern "C" fn servo_webview_set_input_method_callback(
         callback.map(|func| InputMethodCallback { func, user_data });
 }
 
+/// Register the console callback, invoked when content logs to the console.
+/// Pass a NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_console_message_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoConsoleMessageCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.console_message_callback.borrow_mut() =
+        callback.map(|func| ConsoleMessageCallback { func, user_data });
+}
+
+/// Add a script that runs in every page this webview loads from now on.
+///
+/// Servo applies user scripts when a page loads, so a script added after a page
+/// is already showing only takes effect on the next load.
+///
+/// # Safety
+/// `webview` must be a valid handle and `source` a valid NUL-terminated C
+/// string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_add_user_script(
+    webview: *mut ServoWebViewHandle,
+    source: *const c_char,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    if source.is_null() {
+        return;
+    }
+    let Ok(source) = (unsafe { CStr::from_ptr(source) }).to_str() else {
+        return;
+    };
+
+    handle
+        .user_content
+        .add_script(Rc::new(UserScript::new(source.to_owned(), None)));
+}
+
 /// Register the input-method-hidden callback, invoked when focus leaves the
 /// editable field. Pass a NULL `callback` to clear it.
 ///
@@ -1568,10 +1673,12 @@ pub unsafe extern "C" fn servo_webview_create_popup(
 
     let servo = parent.servo.clone();
     let delegate = Rc::new(EmbedderDelegate::new(rendering_context.clone()));
+    let user_content = UserContentManager::new(&servo);
 
     let webview = create_request
         .builder(rendering_context.clone())
         .delegate(delegate.clone())
+        .user_content_manager(Rc::new(user_content.clone()))
         .build();
     webview.focus();
     webview.show();
@@ -1580,6 +1687,7 @@ pub unsafe extern "C" fn servo_webview_create_popup(
         servo,
         webview,
         delegate,
+        user_content,
         _rendering_context: rendering_context,
     }))
 }
@@ -1812,6 +1920,57 @@ pub unsafe extern "C" fn servo_webview_load_uri(
             handle.webview.load(url);
         }
     }
+}
+
+/// Load `html` as a document, as if it had been fetched from `base_uri`.
+///
+/// Servo can only be told to load a URL, so the document is handed over as a
+/// `data:` URL. That has a consequence worth knowing: the document's base URL
+/// becomes the `data:` URL rather than `base_uri`, so relative links and
+/// subresource references in `html` will not resolve against `base_uri`.
+/// Reference resources absolutely, or serve the page from a real URL, if that
+/// matters. `base_uri` is accepted and currently unused, so callers do not have
+/// to change if this gains a real base URL later.
+///
+/// # Safety
+/// `webview` must be a valid handle and `html` a valid NUL-terminated C string;
+/// `base_uri` must be NULL or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_load_html(
+    webview: *mut ServoWebViewHandle,
+    html: *const c_char,
+    base_uri: *const c_char,
+) {
+    let _ = base_uri;
+
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    if html.is_null() {
+        return;
+    }
+    let Ok(html) = (unsafe { CStr::from_ptr(html) }).to_str() else {
+        return;
+    };
+
+    // Percent-encode everything outside the unreserved set, so that a document
+    // containing `#`, `%`, `&` or non-ASCII text survives being read back as a
+    // URL. Base64 would be shorter but needs a dependency to encode.
+    let mut encoded = String::with_capacity(html.len() * 3);
+    for byte in html.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            },
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    let Ok(url) = Url::parse(&format!("data:text/html;charset=utf-8,{encoded}")) else {
+        return;
+    };
+
+    handle.webview.load(url);
 }
 
 /// Reload the current page.

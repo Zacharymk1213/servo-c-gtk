@@ -179,6 +179,24 @@ typedef void (*ServoCreateWebViewCallback)(uint64_t request_id,
  */
 typedef void (*ServoClosedCallback)(void *user_data);
 
+/* Console levels reported to a ServoConsoleMessageCallback. */
+typedef enum {
+    SERVO_CONSOLE_LOG = 0,
+    SERVO_CONSOLE_DEBUG = 1,
+    SERVO_CONSOLE_INFO = 2,
+    SERVO_CONSOLE_WARN = 3,
+    SERVO_CONSOLE_ERROR = 4,
+    SERVO_CONSOLE_TRACE = 5
+} ServoConsoleLevel;
+
+/*
+ * Invoked when content logs to the console. `message` is valid only for the
+ * duration of the call.
+ */
+typedef void (*ServoConsoleMessageCallback)(uint32_t    level,
+                                            const char *message,
+                                            void       *user_data);
+
 /*
  * Invoked when the page focuses an editable field and an input method should be
  * shown. `text` is the field's current contents and `insertion_point` the
@@ -371,6 +389,17 @@ void servo_webview_set_create_webview_callback(ServoWebViewHandle        *webvie
 void servo_webview_set_closed_callback(ServoWebViewHandle *webview,
                                        ServoClosedCallback callback,
                                        void               *user_data);
+void servo_webview_set_console_message_callback(ServoWebViewHandle         *webview,
+                                               ServoConsoleMessageCallback callback,
+                                               void                       *user_data);
+
+/*
+ * Add a script that runs in every page this webview loads from now on. Servo
+ * applies user scripts when a page loads, so a script added after a page is
+ * already showing only takes effect on the next load.
+ */
+void servo_webview_add_user_script(ServoWebViewHandle *webview, const char *source);
+
 void servo_webview_set_input_method_callback(ServoWebViewHandle      *webview,
                                              ServoInputMethodCallback callback,
                                              void                    *user_data);
@@ -398,6 +427,18 @@ ServoWebViewHandle *servo_webview_create_popup(ServoWebViewHandle *webview,
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);
+
+/*
+ * Load `html` as a document, as if it had been fetched from `base_uri`.
+ *
+ * Servo can only be told to load a URL, so the document is handed over as a
+ * data: URL. The document's base URL therefore becomes that data: URL rather
+ * than `base_uri`, so relative links and subresource references in `html` will
+ * not resolve against `base_uri`. `base_uri` is accepted and currently unused.
+ */
+void servo_webview_load_html(ServoWebViewHandle *webview,
+                             const char         *html,
+                             const char         *base_uri);
 void servo_webview_reload(ServoWebViewHandle *webview);
 void servo_webview_go_back(ServoWebViewHandle *webview);
 void servo_webview_go_forward(ServoWebViewHandle *webview);

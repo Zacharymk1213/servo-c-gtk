@@ -197,6 +197,25 @@ void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
     (void) webview; (void) uri;
 }
 
+void
+servo_webview_load_html(ServoWebViewHandle *webview, const char *html, const char *base_uri)
+{
+    (void) webview; (void) html; (void) base_uri;
+}
+
+void
+servo_webview_set_console_message_callback(ServoWebViewHandle         *webview,
+                                           ServoConsoleMessageCallback callback,
+                                           void                       *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void servo_webview_add_user_script(ServoWebViewHandle *webview, const char *source)
+{
+    (void) webview; (void) source;
+}
+
 void servo_webview_reload(ServoWebViewHandle *webview) { (void) webview; }
 void servo_webview_go_back(ServoWebViewHandle *webview) { (void) webview; }
 void servo_webview_go_forward(ServoWebViewHandle *webview) { (void) webview; }
