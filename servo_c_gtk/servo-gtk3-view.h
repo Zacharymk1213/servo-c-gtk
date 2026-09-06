@@ -144,6 +144,9 @@ struct _ServoGtkWebViewClass {
                               gint                y,
                               const gchar *const *labels,
                               guint64             request_id);
+    gboolean (*create_web_view) (ServoGtkWebView *web_view,
+                                 guint64          request_id);
+    void (*close) (ServoGtkWebView *web_view);
 
     /*
      * Padding for future expansion. The original four slots were consumed by
@@ -349,6 +352,26 @@ void servo_gtk_web_view_respond_to_permission_request(ServoGtkWebView *self,
 void servo_gtk_web_view_respond_to_context_menu(ServoGtkWebView *self,
                                                 guint64          request_id,
                                                 gsize            item_index);
+
+/**
+ * servo_gtk_web_view_accept_new_web_view:
+ * @self: the #ServoGtkWebView the request came from
+ * @request_id: the id from the #ServoGtkWebView::create-web-view emission
+ * @popup: a freshly created #ServoGtkWebView to open the popup in
+ *
+ * Accepts a popup request reported by #ServoGtkWebView::create-web-view,
+ * putting the new page in @popup.
+ *
+ * Must be called from inside the signal handler: the request is refused as soon
+ * as the emission returns. @popup must not already be showing a page. It shares
+ * the engine of @self, so both must be driven from the same thread, and its
+ * window should be taken down when it emits #ServoGtkWebView::close.
+ *
+ * Returns: %TRUE if the popup was accepted
+ */
+gboolean servo_gtk_web_view_accept_new_web_view(ServoGtkWebView *self,
+                                                guint64          request_id,
+                                                ServoGtkWebView *popup);
 
 /**
  * servo_gtk_web_view_reload:

@@ -26,10 +26,21 @@ enum {
     AUTHENTICATE,
     PERMISSION_REQUEST,
     CONTEXT_MENU,
+    CREATE_WEB_VIEW,
+    CLOSE,
     N_SIGNALS
 };
 
 static guint signals[N_SIGNALS] = { 0 };
+
+/*
+ * Adopt an already-created Servo webview: store it, push the widget's current
+ * state onto it and register every callback. Used both when the widget creates
+ * its own webview on first allocation and when it adopts one built for a popup.
+ */
+static void servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
+                                            ServoWebViewHandle *handle,
+                                            gint                scale);
 
 /*
  * Embedder-visible page state mirrored from Servo. Kept behind the instance's
@@ -1117,6 +1128,29 @@ servo_gtk_web_view_on_context_menu(guint64                     request_id,
     g_ptr_array_free(labels, TRUE);
 }
 
+/*
+ * Web content asked to open a new webview. Ask the application for one through
+ * ::create-web-view; the handler is expected to accept from inside the
+ * emission, and anything unaccepted when it returns is refused.
+ */
+static void
+servo_gtk_web_view_on_create_webview(guint64 request_id, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gboolean         handled = FALSE;
+
+    g_signal_emit(self, signals[CREATE_WEB_VIEW], 0, request_id, &handled);
+}
+
+/* The page closed its own webview. */
+static void
+servo_gtk_web_view_on_closed(gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    g_signal_emit(self, signals[CLOSE], 0);
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -1288,6 +1322,49 @@ servo_gtk_web_view_draw(GtkDrawingArea *area,
     }
 }
 
+static void
+servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
+                                ServoWebViewHandle *handle,
+                                gint                scale)
+{
+    self->servo = handle;
+
+    servo_webview_set_hidpi_scale_factor(handle, (float) scale);
+    /* Any zoom set before the webview existed was only cached; apply it now. */
+    if (self->priv->zoom_level != 1.0) {
+        servo_webview_set_zoom_level(handle, (float) self->priv->zoom_level);
+    }
+
+    servo_webview_set_frame_ready_callback(
+        handle, servo_gtk_web_view_on_frame_ready, self);
+    servo_webview_set_cursor_changed_callback(
+        handle, servo_gtk_web_view_on_cursor_changed, self);
+    servo_webview_set_url_changed_callback(
+        handle, servo_gtk_web_view_on_url_changed, self);
+    servo_webview_set_title_changed_callback(
+        handle, servo_gtk_web_view_on_title_changed, self);
+    servo_webview_set_load_status_changed_callback(
+        handle, servo_gtk_web_view_on_load_status_changed, self);
+    servo_webview_set_history_changed_callback(
+        handle, servo_gtk_web_view_on_history_changed, self);
+    servo_webview_set_dialog_callback(
+        handle, servo_gtk_web_view_on_dialog, self);
+    servo_webview_set_file_picker_callback(
+        handle, servo_gtk_web_view_on_file_picker, self);
+    servo_webview_set_authentication_callback(
+        handle, servo_gtk_web_view_on_authentication, self);
+    servo_webview_set_permission_callback(
+        handle, servo_gtk_web_view_on_permission, self);
+    servo_webview_set_context_menu_callback(
+        handle, servo_gtk_web_view_on_context_menu, self);
+    servo_webview_set_create_webview_callback(
+        handle, servo_gtk_web_view_on_create_webview, self);
+    servo_webview_set_closed_callback(
+        handle, servo_gtk_web_view_on_closed, self);
+    servo_webview_set_request_cancelled_callback(
+        handle, servo_gtk_web_view_on_request_cancelled, self);
+}
+
 /*
  * Create the Servo instance on first use, or resize it, for a widget whose
  * logical size is width x height. Servo's surface is sized in device pixels, so
@@ -1309,37 +1386,10 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
          * creates the browsing context together with it. Issuing a separate
          * load here instead would race the context's creation and be dropped.
          */
-        self->servo = servo_webview_new(w, h, self->uri);
-        if (self->servo != NULL) {
-            servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
-            /* Any zoom set before allocation was only cached; apply it now. */
-            if (self->priv->zoom_level != 1.0) {
-                servo_webview_set_zoom_level(self->servo, (float) self->priv->zoom_level);
-            }
-            servo_webview_set_frame_ready_callback(
-                self->servo, servo_gtk_web_view_on_frame_ready, self);
-            servo_webview_set_cursor_changed_callback(
-                self->servo, servo_gtk_web_view_on_cursor_changed, self);
-            servo_webview_set_url_changed_callback(
-                self->servo, servo_gtk_web_view_on_url_changed, self);
-            servo_webview_set_title_changed_callback(
-                self->servo, servo_gtk_web_view_on_title_changed, self);
-            servo_webview_set_load_status_changed_callback(
-                self->servo, servo_gtk_web_view_on_load_status_changed, self);
-            servo_webview_set_history_changed_callback(
-                self->servo, servo_gtk_web_view_on_history_changed, self);
-            servo_webview_set_dialog_callback(
-                self->servo, servo_gtk_web_view_on_dialog, self);
-            servo_webview_set_file_picker_callback(
-                self->servo, servo_gtk_web_view_on_file_picker, self);
-            servo_webview_set_authentication_callback(
-                self->servo, servo_gtk_web_view_on_authentication, self);
-            servo_webview_set_permission_callback(
-                self->servo, servo_gtk_web_view_on_permission, self);
-            servo_webview_set_context_menu_callback(
-                self->servo, servo_gtk_web_view_on_context_menu, self);
-            servo_webview_set_request_cancelled_callback(
-                self->servo, servo_gtk_web_view_on_request_cancelled, self);
+        ServoWebViewHandle *handle = servo_webview_new(w, h, self->uri);
+
+        if (handle != NULL) {
+            servo_gtk_web_view_attach_servo(self, handle, scale);
         }
     } else {
         servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
@@ -1932,6 +1982,55 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             G_TYPE_STRV,
             G_TYPE_UINT64
         );
+
+    /**
+     * ServoGtkWebView::create-web-view:
+     * @self: the #ServoGtkWebView the request came from
+     * @request_id: identifies this popup request when accepting it
+     *
+     * Emitted when web content asks to open a new webview — `window.open()`, or
+     * a link with `target="_blank"`.
+     *
+     * To open the popup, create a #ServoGtkWebView, place it in a window and
+     * call servo_gtk_web_view_accept_new_web_view() with @request_id from
+     * inside the handler, then return %TRUE. Returning %FALSE, or not handling
+     * the signal at all, refuses the popup — which is the default, since
+     * nothing at this level can decide where a new window belongs.
+     *
+     * Returns: %TRUE if the popup was accepted
+     */
+    signals[CREATE_WEB_VIEW] =
+        g_signal_new(
+            "create-web-view",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, create_web_view),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            1,
+            G_TYPE_UINT64
+        );
+
+    /**
+     * ServoGtkWebView::close:
+     * @self: the #ServoGtkWebView
+     *
+     * Emitted when the page closes its own webview — `window.close()`, or the
+     * page that opened a popup closing it. Take down whatever window is showing
+     * @self and drop your reference to it.
+     */
+    signals[CLOSE] =
+        g_signal_new(
+            "close",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, close),
+            NULL, NULL, /* accumulator */
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_NONE,
+            0
+        );
 }
 
 static void
@@ -2153,6 +2252,45 @@ servo_gtk_web_view_respond_to_context_menu(ServoGtkWebView *self,
     if (self->servo != NULL) {
         servo_webview_context_menu_respond(self->servo, request_id, item_index);
     }
+}
+
+gboolean
+servo_gtk_web_view_accept_new_web_view(ServoGtkWebView *self,
+                                       guint64          request_id,
+                                       ServoGtkWebView *popup)
+{
+    ServoWebViewHandle *handle;
+    GtkWidget          *widget;
+    gint                scale;
+    guint               width;
+    guint               height;
+
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), FALSE);
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(popup), FALSE);
+    g_return_val_if_fail(popup->servo == NULL, FALSE);
+
+    if (self->servo == NULL) {
+        return FALSE;
+    }
+
+    widget = GTK_WIDGET(self);
+    scale = MAX(1, gtk_widget_get_scale_factor(widget));
+
+    /*
+     * The popup widget may not be allocated yet, so start it at the parent's
+     * size; its own allocation resizes it.
+     */
+    width = (guint) MAX(1, gtk_widget_get_width(widget)) * (guint) scale;
+    height = (guint) MAX(1, gtk_widget_get_height(widget)) * (guint) scale;
+
+    handle = servo_webview_create_popup(self->servo, request_id, width, height);
+    if (handle == NULL) {
+        return FALSE;
+    }
+
+    servo_gtk_web_view_attach_servo(popup, handle, scale);
+
+    return TRUE;
 }
 
 /*

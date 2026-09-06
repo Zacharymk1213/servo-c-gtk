@@ -167,6 +167,31 @@ servo_webview_context_menu_respond(ServoWebViewHandle *webview,
     (void) webview; (void) request_id; (void) item_index;
 }
 
+void
+servo_webview_set_create_webview_callback(ServoWebViewHandle        *webview,
+                                          ServoCreateWebViewCallback callback,
+                                          void                      *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_set_closed_callback(ServoWebViewHandle *webview,
+                                  ServoClosedCallback callback,
+                                  void               *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+ServoWebViewHandle *
+servo_webview_create_popup(ServoWebViewHandle *webview,
+                           uint64_t            request_id,
+                           uint32_t            width,
+                           uint32_t            height)
+{
+    (void) webview; (void) request_id; (void) width; (void) height; return NULL;
+}
+
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 {
     (void) webview; (void) uri;

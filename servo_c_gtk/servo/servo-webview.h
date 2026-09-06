@@ -164,6 +164,22 @@ typedef void (*ServoContextMenuCallback)(uint64_t                    request_id,
                                          void                       *user_data);
 
 /*
+ * Invoked when web content asks to open a new webview — window.open(), or a
+ * link with target="_blank". Accept it by calling servo_webview_create_popup()
+ * with `request_id` from inside this callback; returning without accepting
+ * refuses the popup.
+ */
+typedef void (*ServoCreateWebViewCallback)(uint64_t request_id,
+                                           void    *user_data);
+
+/*
+ * Invoked when a webview closes itself — window.close(), or the page that
+ * opened a popup closing it. Take down whatever window is showing this webview
+ * and free its handle.
+ */
+typedef void (*ServoClosedCallback)(void *user_data);
+
+/*
  * Invoked when a server or proxy issues an HTTP authentication challenge. The
  * request is NOT answered when this returns: prompt for credentials and call
  * servo_webview_authentication_respond() with `request_id`.
@@ -325,6 +341,30 @@ void servo_webview_set_context_menu_callback(ServoWebViewHandle      *webview,
 void servo_webview_context_menu_respond(ServoWebViewHandle *webview,
                                         uint64_t            request_id,
                                         size_t              item_index);
+
+void servo_webview_set_create_webview_callback(ServoWebViewHandle        *webview,
+                                               ServoCreateWebViewCallback callback,
+                                               void                      *user_data);
+void servo_webview_set_closed_callback(ServoWebViewHandle *webview,
+                                       ServoClosedCallback callback,
+                                       void               *user_data);
+
+/*
+ * Accept a popup request reported through a ServoCreateWebViewCallback and build
+ * its webview, with a surface of width x height device pixels. Must be called
+ * from inside that callback: the request is refused as soon as it returns.
+ *
+ * The popup joins the parent's engine, so both handles must be driven from the
+ * same thread; spinning either one advances both. The returned handle is owned
+ * by the caller and must be freed with servo_webview_free(), and starts with no
+ * callbacks registered — register them before spinning or the first frame is
+ * lost. Returns NULL for an unknown `request_id` or if the surface could not be
+ * created, in which case the popup is refused.
+ */
+ServoWebViewHandle *servo_webview_create_popup(ServoWebViewHandle *webview,
+                                               uint64_t            request_id,
+                                               uint32_t            width,
+                                               uint32_t            height);
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);

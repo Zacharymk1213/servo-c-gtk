@@ -196,6 +196,43 @@ on_dialog_test_clicked(GtkButton *button, gpointer user_data)
         NULL);
 }
 
+/* A popup closed itself: take its window down. */
+static void
+on_popup_close(ServoGtkWebView *web_view, gpointer user_data)
+{
+    (void) web_view;
+
+    gtk_widget_destroy(GTK_WIDGET(user_data));
+}
+
+/*
+ * The page called window.open(). Put the new web view in its own window and
+ * accept the request from inside the handler, which is the only point at which
+ * the request is still open.
+ */
+static gboolean
+on_create_web_view(ServoGtkWebView *web_view, guint64 request_id, gpointer user_data)
+{
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    GtkWidget *popup = GTK_WIDGET(servo_gtk_web_view_new());
+
+    gtk_window_set_title(GTK_WINDOW(window), "Servo GTK Demo - Popup");
+    gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);
+    gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(user_data));
+    gtk_container_add(GTK_CONTAINER(window), popup);
+
+    if (!servo_gtk_web_view_accept_new_web_view(web_view, request_id,
+                                                SERVO_GTK_WEB_VIEW(popup))) {
+        gtk_widget_destroy(window);
+        return FALSE;
+    }
+
+    g_signal_connect(popup, "close", G_CALLBACK(on_popup_close), window);
+    gtk_widget_show_all(window);
+
+    return TRUE;
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -309,6 +346,8 @@ activate(GtkApplication *app, gpointer user_data)
                      G_CALLBACK(on_web_view_title_changed), window);
     g_signal_connect(web_view, "load-changed",
                      G_CALLBACK(on_web_view_load_changed), NULL);
+    g_signal_connect(web_view, "create-web-view",
+                     G_CALLBACK(on_create_web_view), window);
 
     gtk_box_pack_start(GTK_BOX(box), web_view, TRUE, TRUE, 0);
 

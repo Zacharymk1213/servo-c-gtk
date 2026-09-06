@@ -31,8 +31,9 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    AuthenticationRequest, ContextMenu, ContextMenuAction, ContextMenuItem, EmbedderControl,
-    EmbedderControlId, FilePicker, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    AuthenticationRequest, ContextMenu, ContextMenuAction, ContextMenuItem,
+    CreateNewWebViewRequest, EmbedderControl, EmbedderControlId, FilePicker, Key, KeyState,
+    KeyboardEvent, LoadStatus, Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
     PermissionFeature, PermissionRequest, PrefValue, Preferences, RenderingContext, Scroll,
     Servo, ServoBuilder, SimpleDialog,
@@ -177,6 +178,20 @@ pub type ServoContextMenuCallback = extern "C" fn(
     user_data: *mut c_void,
 );
 
+/// Called when web content asks to open a new webview — `window.open()`, or a
+/// link with `target="_blank"`.
+///
+/// Accept it by calling [`servo_webview_create_popup`] with `request_id` from
+/// inside this callback. Returning without accepting refuses the popup, which
+/// is also what happens with no callback registered.
+pub type ServoCreateWebViewCallback =
+    extern "C" fn(request_id: u64, user_data: *mut c_void);
+
+/// Called when a webview closes itself — `window.close()`, or the page that
+/// opened a popup closing it. The host should take down whatever window is
+/// showing this webview and free its handle.
+pub type ServoClosedCallback = extern "C" fn(user_data: *mut c_void);
+
 /// Called when a server or proxy asks for HTTP authentication.
 ///
 /// The request is *not* answered when this returns: the host prompts for
@@ -265,6 +280,7 @@ enum PendingRequest {
     Authentication(AuthenticationRequest),
     Permission(PermissionRequest),
     ContextMenu(ContextMenu),
+    CreateWebView(CreateNewWebViewRequest),
 }
 
 /// A [`PendingRequest`] plus the engine-side id it arrived with, which is what
@@ -386,6 +402,16 @@ struct ContextMenuCallback {
     user_data: *mut c_void,
 }
 
+struct CreateWebViewCallback {
+    func: ServoCreateWebViewCallback,
+    user_data: *mut c_void,
+}
+
+struct ClosedCallback {
+    func: ServoClosedCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -401,6 +427,8 @@ struct EmbedderDelegate {
     authentication_callback: RefCell<Option<AuthenticationCallback>>,
     permission_callback: RefCell<Option<PermissionCallback>>,
     context_menu_callback: RefCell<Option<ContextMenuCallback>>,
+    create_webview_callback: RefCell<Option<CreateWebViewCallback>>,
+    closed_callback: RefCell<Option<ClosedCallback>>,
     request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
     requests: RequestRegistry,
 }
@@ -420,6 +448,8 @@ impl EmbedderDelegate {
             authentication_callback: RefCell::new(None),
             permission_callback: RefCell::new(None),
             context_menu_callback: RefCell::new(None),
+            create_webview_callback: RefCell::new(None),
+            closed_callback: RefCell::new(None),
             request_cancelled_callback: RefCell::new(None),
             requests: RequestRegistry::default(),
         }
@@ -577,6 +607,40 @@ impl WebViewDelegate for EmbedderDelegate {
             .insert(None, PendingRequest::Permission(permission_request));
 
         func(id, feature, user_data);
+    }
+
+    fn request_create_new(&self, _parent_webview: WebView, request: CreateNewWebViewRequest) {
+        let cb = self
+            .create_webview_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        // With no callback the request is dropped, which refuses the popup.
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        let id = self
+            .requests
+            .insert(None, PendingRequest::CreateWebView(request));
+
+        func(id, user_data);
+
+        // The host is expected to accept from inside the callback. Anything
+        // still here afterwards is dropped, which refuses the popup rather than
+        // leaving window.open() waiting on an answer that will not come.
+        drop(self.requests.take(id));
+    }
+
+    fn notify_closed(&self, _webview: WebView) {
+        let cb = self
+            .closed_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        if let Some((func, user_data)) = cb {
+            func(user_data);
+        }
     }
 
     fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
@@ -1208,6 +1272,104 @@ pub unsafe extern "C" fn servo_webview_set_context_menu_callback(
     };
     *handle.delegate.context_menu_callback.borrow_mut() =
         callback.map(|func| ContextMenuCallback { func, user_data });
+}
+
+/// Register the popup callback, invoked when web content asks to open a new
+/// webview. Pass a NULL `callback` to clear it.
+///
+/// With no callback registered, popups are refused.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_create_webview_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoCreateWebViewCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.create_webview_callback.borrow_mut() =
+        callback.map(|func| CreateWebViewCallback { func, user_data });
+}
+
+/// Register the closed callback, invoked when the webview closes itself.
+/// Pass a NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_closed_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoClosedCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.closed_callback.borrow_mut() =
+        callback.map(|func| ClosedCallback { func, user_data });
+}
+
+/// Accept a popup request reported through a [`ServoCreateWebViewCallback`] and
+/// build its webview, with a surface of `width` x `height` device pixels.
+///
+/// Must be called from inside that callback: the request is refused as soon as
+/// the callback returns.
+///
+/// The popup joins the parent's engine, so both handles must be driven from the
+/// same thread; spinning either one advances both. The returned handle is owned
+/// by the caller and must be freed with [`servo_webview_free`], and starts with
+/// no callbacks registered — register them before spinning or the first frame
+/// is lost.
+///
+/// Returns NULL for an unknown `request_id` or if the surface could not be
+/// created; the popup is refused in that case.
+///
+/// # Safety
+/// `webview` must be the valid parent handle the callback came from.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_create_popup(
+    webview: *mut ServoWebViewHandle,
+    request_id: u64,
+    width: u32,
+    height: u32,
+) -> *mut ServoWebViewHandle {
+    let Some(parent) = (unsafe { as_handle(webview) }) else {
+        return ptr::null_mut();
+    };
+    let Some(PendingRequest::CreateWebView(create_request)) =
+        parent.delegate.requests.take(request_id)
+    else {
+        return ptr::null_mut();
+    };
+
+    let size = dpi::PhysicalSize::new(width.max(1), height.max(1));
+    let rendering_context = match SoftwareRenderingContext::new(size) {
+        Ok(context) => Rc::new(context),
+        // `create_request` is dropped here, which refuses the popup.
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let servo = parent.servo.clone();
+    let delegate = Rc::new(EmbedderDelegate::new(rendering_context.clone()));
+
+    let webview = create_request
+        .builder(rendering_context.clone())
+        .delegate(delegate.clone())
+        .build();
+    webview.focus();
+    webview.show();
+
+    Box::into_raw(Box::new(ServoWebViewHandle {
+        servo,
+        webview,
+        delegate,
+        _rendering_context: rendering_context,
+    }))
 }
 
 /// Answer a context menu reported through a [`ServoContextMenuCallback`].
