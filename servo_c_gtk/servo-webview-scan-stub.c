@@ -106,6 +106,16 @@ void servo_webview_set_hidpi_scale_factor(ServoWebViewHandle *webview, float sca
     (void) webview; (void) scale;
 }
 
+void servo_webview_set_zoom_level(ServoWebViewHandle *webview, float zoom)
+{
+    (void) webview; (void) zoom;
+}
+
+float servo_webview_get_zoom_level(ServoWebViewHandle *webview)
+{
+    (void) webview; return 1.0f;
+}
+
 void servo_webview_pointer_move(ServoWebViewHandle *webview, double x, double y)
 {
     (void) webview; (void) x; (void) y;

@@ -145,6 +145,27 @@ gboolean servo_gtk_web_view_can_go_back(ServoGtkWebView *self);
 gboolean servo_gtk_web_view_can_go_forward(ServoGtkWebView *self);
 
 /**
+ * servo_gtk_web_view_set_zoom_level:
+ * @self: a #ServoGtkWebView
+ * @zoom_level: the zoom level, where 1.0 is unzoomed
+ *
+ * Sets the page zoom level, as a browser's Ctrl+/Ctrl- would: the page's
+ * devicePixelRatio changes and the page re-lays out, rather than the rendered
+ * result simply being magnified. The value is clamped to [0.1, 10.0].
+ */
+void servo_gtk_web_view_set_zoom_level(ServoGtkWebView *self, gdouble zoom_level);
+
+/**
+ * servo_gtk_web_view_get_zoom_level:
+ * @self: a #ServoGtkWebView
+ *
+ * Gets the page zoom level set by servo_gtk_web_view_set_zoom_level().
+ *
+ * Returns: the current zoom level, where 1.0 is unzoomed
+ */
+gdouble servo_gtk_web_view_get_zoom_level(ServoGtkWebView *self);
+
+/**
  * servo_gtk_web_view_reload:
  * @self: a #ServoGtkWebView
  *

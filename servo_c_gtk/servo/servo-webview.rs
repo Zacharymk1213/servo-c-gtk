@@ -659,6 +659,41 @@ pub unsafe extern "C" fn servo_webview_set_hidpi_scale_factor(
     }
 }
 
+/// Set the page zoom level: 1.0 is unzoomed, 2.0 is double size. This is the
+/// zoom a browser's Ctrl+/Ctrl- applies — it changes the page's
+/// `devicePixelRatio` and makes it re-lay out, rather than just magnifying the
+/// rendered result.
+///
+/// Servo clamps the value to the inclusive range [0.1, 10.0]. Non-finite values
+/// are ignored.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_zoom_level(
+    webview: *mut ServoWebViewHandle,
+    zoom: f32,
+) {
+    if !zoom.is_finite() || zoom <= 0.0 {
+        return;
+    }
+    if let Some(handle) = unsafe { as_handle(webview) } {
+        handle.webview.set_page_zoom(zoom);
+    }
+}
+
+/// Return the current page zoom level. An invalid handle reports 1.0.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_get_zoom_level(webview: *mut ServoWebViewHandle) -> f32 {
+    match unsafe { as_handle(webview) } {
+        Some(handle) => handle.webview.page_zoom(),
+        None => 1.0,
+    }
+}
+
 /// Report pointer movement to `(x, y)` in device pixels.
 ///
 /// # Safety

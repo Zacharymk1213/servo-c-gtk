@@ -11,6 +11,7 @@ enum {
     PROP_IS_LOADING,
     PROP_CAN_GO_BACK,
     PROP_CAN_GO_FORWARD,
+    PROP_ZOOM_LEVEL,
     N_PROPERTIES
 };
 
@@ -34,6 +35,11 @@ struct _ServoGtkWebViewPrivate {
     gboolean  is_loading;
     gboolean  can_go_back;
     gboolean  can_go_forward;
+    /*
+     * Mirrored rather than read back from Servo so the property is readable
+     * before the widget is allocated and Servo exists.
+     */
+    gdouble   zoom_level;
 };
 
 /*
@@ -245,6 +251,10 @@ servo_gtk_web_view_set_property(GObject      *object,
         servo_gtk_web_view_load_uri(self, g_value_get_string(value));
         break;
 
+    case PROP_ZOOM_LEVEL:
+        servo_gtk_web_view_set_zoom_level(self, g_value_get_double(value));
+        break;
+
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -278,6 +288,10 @@ servo_gtk_web_view_get_property(GObject    *object,
 
     case PROP_CAN_GO_FORWARD:
         g_value_set_boolean(value, self->priv->can_go_forward);
+        break;
+
+    case PROP_ZOOM_LEVEL:
+        g_value_set_double(value, self->priv->zoom_level);
         break;
 
     default:
@@ -386,6 +400,10 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
         self->servo = servo_webview_new(w, h, self->uri);
         if (self->servo != NULL) {
             servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
+            /* Any zoom set before allocation was only cached; apply it now. */
+            if (self->priv->zoom_level != 1.0) {
+                servo_webview_set_zoom_level(self->servo, (float) self->priv->zoom_level);
+            }
             servo_webview_set_frame_ready_callback(
                 self->servo, servo_gtk_web_view_on_frame_ready, self);
             servo_webview_set_cursor_changed_callback(
@@ -739,6 +757,15 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             G_PARAM_READABLE | G_PARAM_STATIC_STRINGS
         );
 
+    properties[PROP_ZOOM_LEVEL] =
+        g_param_spec_double(
+            "zoom-level",
+            "Zoom level",
+            "The page zoom level, where 1.0 is unzoomed",
+            0.1, 10.0, 1.0,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
+        );
+
     g_object_class_install_properties(object_class, N_PROPERTIES, properties);
 
     /**
@@ -792,6 +819,7 @@ servo_gtk_web_view_init(ServoGtkWebView *self)
     GtkWidget *widget = GTK_WIDGET(self);
 
     self->priv = g_new0(ServoGtkWebViewPrivate, 1);
+    self->priv->zoom_level = 1.0;
 
     gtk_widget_set_focusable(widget, TRUE);
 
@@ -899,6 +927,35 @@ servo_gtk_web_view_can_go_forward(ServoGtkWebView *self)
     g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), FALSE);
 
     return self->priv->can_go_forward;
+}
+
+void
+servo_gtk_web_view_set_zoom_level(ServoGtkWebView *self, gdouble zoom_level)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    zoom_level = CLAMP(zoom_level, 0.1, 10.0);
+
+    if (self->priv->zoom_level == zoom_level) {
+        return;
+    }
+
+    self->priv->zoom_level = zoom_level;
+
+    /* Before allocation there is no Servo yet; the value is applied on create. */
+    if (self->servo != NULL) {
+        servo_webview_set_zoom_level(self->servo, (float) zoom_level);
+    }
+
+    g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_ZOOM_LEVEL]);
+}
+
+gdouble
+servo_gtk_web_view_get_zoom_level(ServoGtkWebView *self)
+{
+    g_return_val_if_fail(SERVO_GTK_IS_WEB_VIEW(self), 1.0);
+
+    return self->priv->zoom_level;
 }
 
 /*

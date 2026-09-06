@@ -141,6 +141,15 @@ void servo_webview_resize(ServoWebViewHandle *webview,
 void servo_webview_set_hidpi_scale_factor(ServoWebViewHandle *webview,
                                           float               scale);
 
+/*
+ * Page zoom: 1.0 is unzoomed, 2.0 double size. This is the zoom a browser's
+ * Ctrl+/Ctrl- applies — it changes the page's devicePixelRatio and makes it
+ * re-lay out, rather than magnifying the rendered result. Servo clamps the
+ * value to the inclusive range [0.1, 10.0]; non-finite values are ignored.
+ */
+void  servo_webview_set_zoom_level(ServoWebViewHandle *webview, float zoom);
+float servo_webview_get_zoom_level(ServoWebViewHandle *webview);
+
 /* Input. `button`: 1 = left, 2 = middle, 3 = right (GDK numbering). */
 void servo_webview_pointer_move(ServoWebViewHandle *webview, double x, double y);
 void servo_webview_pointer_button(ServoWebViewHandle *webview,

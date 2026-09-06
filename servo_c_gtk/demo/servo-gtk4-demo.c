@@ -145,6 +145,39 @@ on_web_view_load_changed(ServoGtkWebView   *web_view,
     }
 }
 
+/* Step the page zoom by a multiplicative factor, or reset it when factor is 0. */
+static void
+zoom_by(ServoGtkWebView *web_view, gdouble factor)
+{
+    gdouble zoom = factor == 0.0
+        ? 1.0
+        : servo_gtk_web_view_get_zoom_level(web_view) * factor;
+
+    servo_gtk_web_view_set_zoom_level(web_view, zoom);
+    g_print("Zoom: %.0f%%\n", servo_gtk_web_view_get_zoom_level(web_view) * 100.0);
+}
+
+static void
+on_zoom_out_clicked(GtkButton *button, gpointer user_data)
+{
+    (void) button;
+    zoom_by(SERVO_GTK_WEB_VIEW(user_data), 1.0 / 1.2);
+}
+
+static void
+on_zoom_in_clicked(GtkButton *button, gpointer user_data)
+{
+    (void) button;
+    zoom_by(SERVO_GTK_WEB_VIEW(user_data), 1.2);
+}
+
+static void
+on_zoom_reset_clicked(GtkButton *button, gpointer user_data)
+{
+    (void) button;
+    zoom_by(SERVO_GTK_WEB_VIEW(user_data), 0.0);
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -155,6 +188,9 @@ activate(GtkApplication *app, gpointer user_data)
     GtkWidget  *back_button;
     GtkWidget  *forward_button;
     GtkWidget  *reload_button;
+    GtkWidget  *zoom_out_button;
+    GtkWidget  *zoom_in_button;
+    GtkWidget  *zoom_reset_button;
     GtkWidget  *url_entry;
     GtkWidget  *color_button;
     GtkWidget  *web_view;
@@ -214,6 +250,21 @@ activate(GtkApplication *app, gpointer user_data)
     gtk_widget_set_hexpand(url_entry, TRUE);
     g_signal_connect(url_entry, "activate", G_CALLBACK(on_url_entry_activate), web_view);
     gtk_box_append(GTK_BOX(url_bar), url_entry);
+
+    zoom_out_button = gtk_button_new_from_icon_name("zoom-out-symbolic");
+    gtk_widget_set_tooltip_text(zoom_out_button, "Zoom out");
+    g_signal_connect(zoom_out_button, "clicked", G_CALLBACK(on_zoom_out_clicked), web_view);
+    gtk_box_append(GTK_BOX(url_bar), zoom_out_button);
+
+    zoom_reset_button = gtk_button_new_from_icon_name("zoom-original-symbolic");
+    gtk_widget_set_tooltip_text(zoom_reset_button, "Reset zoom");
+    g_signal_connect(zoom_reset_button, "clicked", G_CALLBACK(on_zoom_reset_clicked), web_view);
+    gtk_box_append(GTK_BOX(url_bar), zoom_reset_button);
+
+    zoom_in_button = gtk_button_new_from_icon_name("zoom-in-symbolic");
+    gtk_widget_set_tooltip_text(zoom_in_button, "Zoom in");
+    g_signal_connect(zoom_in_button, "clicked", G_CALLBACK(on_zoom_in_clicked), web_view);
+    gtk_box_append(GTK_BOX(url_bar), zoom_in_button);
 
     color_button = gtk_color_button_new();
     gtk_widget_set_tooltip_text(color_button, "Set the color of all <h1> headings");
