@@ -81,6 +81,14 @@ struct _ServoGtkWebViewPrivate {
      */
     const ServoContextMenuItem *menu_items;
     gsize                       menu_item_count;
+    /*
+     * Live touch points: GdkEventSequence* -> touch id. GTK identifies a finger
+     * by an opaque sequence pointer that is only valid while the touch lasts,
+     * while Servo wants a small integer that is stable for the whole gesture
+     * and distinct between fingers, so the mapping is kept here.
+     */
+    GHashTable *touch_sequences;
+    gint        next_touch_id;
 };
 
 /* ------------------------------------------------------------------ *
@@ -137,6 +145,16 @@ G_GNUC_INTERNAL gboolean servo_gtk_web_view_key(ServoGtkWebView *self,
 
 G_GNUC_INTERNAL double servo_gtk_web_view_to_device(ServoGtkWebView *self,
                                                     double           value);
+
+/*
+ * Forward one touch point to Servo, resolving @sequence to a touch id that is
+ * stable for the gesture. Coordinates are in widget (logical) units.
+ */
+G_GNUC_INTERNAL void servo_gtk_web_view_touch(ServoGtkWebView   *self,
+                                              ServoTouchPhase    phase,
+                                              GdkEventSequence  *sequence,
+                                              gdouble            x,
+                                              gdouble            y);
 
 G_GNUC_INTERNAL void script_dialog_closure_free(gpointer data);
 G_GNUC_INTERNAL void script_dialog_respond(GtkWidget *window, gboolean accepted);

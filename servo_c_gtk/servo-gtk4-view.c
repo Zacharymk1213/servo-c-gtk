@@ -664,6 +664,43 @@ servo_gtk_web_view_on_key_released(GtkEventControllerKey *controller,
     servo_gtk_web_view_key(self, keyval, state, FALSE);
 }
 
+/*
+ * GTK4 has no high-level controller that reports individual touch points with
+ * their sequences, so raw GDK touch events are taken from a legacy controller.
+ * Returning FALSE leaves them to propagate, so the gestures above still get
+ * their synthesised pointer events.
+ */
+static gboolean
+servo_gtk_web_view_on_legacy_event(GtkEventControllerLegacy *controller,
+                                   GdkEvent                 *event,
+                                   gpointer                  user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    ServoTouchPhase  phase;
+    gdouble          x = 0.0;
+    gdouble          y = 0.0;
+
+    (void) controller;
+
+    switch (gdk_event_get_event_type(event)) {
+    case GDK_TOUCH_BEGIN:  phase = SERVO_TOUCH_DOWN; break;
+    case GDK_TOUCH_UPDATE: phase = SERVO_TOUCH_MOVE; break;
+    case GDK_TOUCH_END:    phase = SERVO_TOUCH_UP; break;
+    case GDK_TOUCH_CANCEL: phase = SERVO_TOUCH_CANCEL; break;
+    default:
+        return FALSE;
+    }
+
+    if (!gdk_event_get_position(event, &x, &y)) {
+        return FALSE;
+    }
+
+    servo_gtk_web_view_touch(
+        self, phase, gdk_event_get_event_sequence(event), x, y);
+
+    return FALSE;
+}
+
 void
 servo_gtk_web_view_class_init_toolkit(ServoGtkWebViewClass *klass)
 {
@@ -714,4 +751,8 @@ servo_gtk_web_view_init_toolkit(ServoGtkWebView *self)
     g_signal_connect(key, "key-pressed", G_CALLBACK(servo_gtk_web_view_on_key_pressed), self);
     g_signal_connect(key, "key-released", G_CALLBACK(servo_gtk_web_view_on_key_released), self);
     gtk_widget_add_controller(widget, key);
+
+    GtkEventController *legacy = gtk_event_controller_legacy_new();
+    g_signal_connect(legacy, "event", G_CALLBACK(servo_gtk_web_view_on_legacy_event), self);
+    gtk_widget_add_controller(widget, legacy);
 }

@@ -524,6 +524,31 @@ servo_gtk_web_view_key_release(GtkWidget *widget, GdkEventKey *event)
         SERVO_GTK_WEB_VIEW(widget), event->keyval, event->state, FALSE);
 }
 
+/*
+ * GTK3 delivers each touch point as a GdkEventTouch carrying its own sequence.
+ * Returning FALSE lets GTK go on synthesising pointer events from the first
+ * touch, so a page with no touch handling still works with a finger.
+ */
+static gboolean
+servo_gtk_web_view_touch_event(GtkWidget *widget, GdkEventTouch *event)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
+    ServoTouchPhase  phase;
+
+    switch (event->type) {
+    case GDK_TOUCH_BEGIN:  phase = SERVO_TOUCH_DOWN; break;
+    case GDK_TOUCH_UPDATE: phase = SERVO_TOUCH_MOVE; break;
+    case GDK_TOUCH_END:    phase = SERVO_TOUCH_UP; break;
+    case GDK_TOUCH_CANCEL: phase = SERVO_TOUCH_CANCEL; break;
+    default:
+        return FALSE;
+    }
+
+    servo_gtk_web_view_touch(self, phase, event->sequence, event->x, event->y);
+
+    return FALSE;
+}
+
 void
 servo_gtk_web_view_class_init_toolkit(ServoGtkWebViewClass *klass)
 {
@@ -538,6 +563,7 @@ servo_gtk_web_view_class_init_toolkit(ServoGtkWebViewClass *klass)
     widget_class->scroll_event = servo_gtk_web_view_scroll;
     widget_class->key_press_event = servo_gtk_web_view_key_press;
     widget_class->key_release_event = servo_gtk_web_view_key_release;
+    widget_class->touch_event = servo_gtk_web_view_touch_event;
 }
 
 void
@@ -557,5 +583,6 @@ servo_gtk_web_view_init_toolkit(ServoGtkWebView *self)
         | GDK_SMOOTH_SCROLL_MASK
         | GDK_KEY_PRESS_MASK
         | GDK_KEY_RELEASE_MASK
+        | GDK_TOUCH_MASK
     );
 }

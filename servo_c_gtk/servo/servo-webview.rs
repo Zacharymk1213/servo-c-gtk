@@ -36,7 +36,7 @@ use servo::{
     KeyboardEvent, LoadStatus, Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
     PermissionFeature, PermissionRequest, PrefValue, Preferences, RenderingContext, Scroll,
-    Servo, ServoBuilder, SimpleDialog,
+    Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType, TouchId,
     SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
     WebViewVector,
 };
@@ -1846,6 +1846,58 @@ mod servo_modifier {
     pub const META: u32 = 1 << 3;
 }
 
+/// Touch phases understood by [`servo_webview_touch`]. Mirrors the
+/// `SERVO_TOUCH_*` constants in `servo-webview.h` — keep the two in sync.
+mod servo_touch {
+    pub const DOWN: u32 = 0;
+    pub const MOVE: u32 = 1;
+    pub const UP: u32 = 2;
+    pub const CANCEL: u32 = 3;
+}
+
+/// Map a `ServoTouchPhase` value to Servo's [`TouchEventType`].
+///
+/// An unrecognised phase becomes `Cancel`: dropping a touch the host has
+/// stopped tracking would leave the page believing a finger is still down.
+fn touch_event_type_from_abi(phase: u32) -> TouchEventType {
+    match phase {
+        servo_touch::DOWN => TouchEventType::Down,
+        servo_touch::MOVE => TouchEventType::Move,
+        servo_touch::UP => TouchEventType::Up,
+        _ => TouchEventType::Cancel,
+    }
+}
+
+/// Report a touch point at `(x, y)` in device pixels.
+///
+/// `phase` is a `SERVO_TOUCH_*` value. `touch_id` identifies one finger across
+/// its whole gesture: the same id must be used for the `DOWN`, every `MOVE`,
+/// and the `UP` or `CANCEL` that ends it, and two fingers on screen at once
+/// must have different ids.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_touch(
+    webview: *mut ServoWebViewHandle,
+    phase: u32,
+    touch_id: i32,
+    x: f64,
+    y: f64,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+
+    handle
+        .webview
+        .notify_input_event(InputEvent::Touch(TouchEvent::new(
+            touch_event_type_from_abi(phase),
+            TouchId(touch_id),
+            WebViewPoint::Device(Point2D::new(x as f32, y as f32)),
+        )));
+}
+
 /// Report a key press (`pressed == true`) or release to the webview.
 ///
 /// * `key` — a `ServoKey` value. Named keys (Enter, Tab, arrows, …) map to the
@@ -2401,6 +2453,37 @@ mod tests {
             modifiers_from_abi(servo_modifier::SHIFT | 1 << 20),
             Modifiers::SHIFT
         );
+    }
+
+    // `TouchEventType` is not PartialEq, so match on the variant.
+    #[test]
+    fn touch_phases_map_to_the_abi() {
+        assert!(matches!(
+            touch_event_type_from_abi(servo_touch::DOWN),
+            TouchEventType::Down
+        ));
+        assert!(matches!(
+            touch_event_type_from_abi(servo_touch::MOVE),
+            TouchEventType::Move
+        ));
+        assert!(matches!(
+            touch_event_type_from_abi(servo_touch::UP),
+            TouchEventType::Up
+        ));
+        assert!(matches!(
+            touch_event_type_from_abi(servo_touch::CANCEL),
+            TouchEventType::Cancel
+        ));
+    }
+
+    #[test]
+    fn an_unknown_touch_phase_cancels() {
+        // Dropping it instead would leave the page believing a finger is still
+        // down, with no event that could ever release it.
+        assert!(matches!(
+            touch_event_type_from_abi(9999),
+            TouchEventType::Cancel
+        ));
     }
 
     // ---- enum mappings ----------------------------------------------------

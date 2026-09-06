@@ -409,6 +409,30 @@ void servo_webview_pointer_button(ServoWebViewHandle *webview,
                                   double              y);
 void servo_webview_scroll(ServoWebViewHandle *webview, double dx, double dy);
 
+/* The stage a touch point is at. */
+typedef enum {
+    SERVO_TOUCH_DOWN = 0,
+    SERVO_TOUCH_MOVE = 1,
+    SERVO_TOUCH_UP = 2,
+    SERVO_TOUCH_CANCEL = 3
+} ServoTouchPhase;
+
+/*
+ * Report a touch point at (x, y) in device pixels. `phase` is a
+ * ServoTouchPhase.
+ *
+ * `touch_id` identifies one finger across its whole gesture: the same id must
+ * be used for the DOWN, every MOVE, and the UP or CANCEL that ends it, and two
+ * fingers on screen at once must have different ids. An unrecognised phase is
+ * treated as CANCEL rather than dropped, so a touch the host has stopped
+ * tracking cannot leave the page believing a finger is still down.
+ */
+void servo_webview_touch(ServoWebViewHandle *webview,
+                         uint32_t            phase,
+                         int32_t             touch_id,
+                         double              x,
+                         double              y);
+
 /*
  * Named keys understood by servo_webview_key(). SERVO_KEY_CHARACTER means the
  * key produced text — pass its Unicode codepoint in the `unicode` argument. All

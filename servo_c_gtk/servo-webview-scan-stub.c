@@ -247,6 +247,16 @@ servo_webview_pointer_button(ServoWebViewHandle *webview,
     (void) webview; (void) button; (void) pressed; (void) x; (void) y;
 }
 
+void
+servo_webview_touch(ServoWebViewHandle *webview,
+                    uint32_t            phase,
+                    int32_t             touch_id,
+                    double              x,
+                    double              y)
+{
+    (void) webview; (void) phase; (void) touch_id; (void) x; (void) y;
+}
+
 void servo_webview_scroll(ServoWebViewHandle *webview, double dx, double dy)
 {
     (void) webview; (void) dx; (void) dy;

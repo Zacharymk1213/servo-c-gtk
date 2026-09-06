@@ -735,6 +735,7 @@ servo_gtk_web_view_finalize(GObject *object)
     g_clear_pointer(&self->uri, g_free);
     g_clear_pointer(&self->priv->title, g_free);
     g_clear_pointer(&self->priv->dialogs, g_hash_table_unref);
+    g_clear_pointer(&self->priv->touch_sequences, g_hash_table_unref);
     g_clear_pointer(&self->priv, g_free);
 
     G_OBJECT_CLASS(servo_gtk_web_view_parent_class)->finalize(object);
@@ -838,6 +839,59 @@ servo_gtk_web_view_on_scale_factor_changed(GObject    *object,
 
     servo_gtk_web_view_sync_surface(
         self, SERVO_GTK_WIDGET_WIDTH(widget), SERVO_GTK_WIDGET_HEIGHT(widget));
+}
+
+/*
+ * Forward one touch point to Servo.
+ *
+ * GTK identifies a finger by a GdkEventSequence pointer that is only valid
+ * while the touch lasts; Servo wants a small integer, stable across the whole
+ * gesture and distinct between fingers. Sequences are therefore mapped to
+ * counter-allocated ids on the way down, and the mapping is dropped when the
+ * touch ends so the table cannot grow without bound. An id is only reused after
+ * the counter wraps, which takes 2^31 touches.
+ *
+ * A MOVE or UP for a sequence that was never seen going down — the touch began
+ * before the widget was ready, or on another widget — allocates an id anyway
+ * rather than being dropped, so the page still sees the end of the gesture.
+ */
+void
+servo_gtk_web_view_touch(ServoGtkWebView  *self,
+                         ServoTouchPhase   phase,
+                         GdkEventSequence *sequence,
+                         gdouble           x,
+                         gdouble           y)
+{
+    gpointer stored;
+    gint     touch_id;
+
+    if (self->servo == NULL) {
+        return;
+    }
+
+    if (self->priv->touch_sequences == NULL) {
+        self->priv->touch_sequences = g_hash_table_new(NULL, NULL);
+    }
+
+    if (g_hash_table_lookup_extended(self->priv->touch_sequences, sequence,
+                                     NULL, &stored)) {
+        touch_id = GPOINTER_TO_INT(stored);
+    } else {
+        touch_id = self->priv->next_touch_id++;
+        g_hash_table_insert(self->priv->touch_sequences, sequence,
+                            GINT_TO_POINTER(touch_id));
+    }
+
+    servo_webview_touch(self->servo,
+                        phase,
+                        touch_id,
+                        servo_gtk_web_view_to_device(self, x),
+                        servo_gtk_web_view_to_device(self, y));
+
+    /* The sequence pointer dies with the touch; do not keep it around. */
+    if (phase == SERVO_TOUCH_UP || phase == SERVO_TOUCH_CANCEL) {
+        g_hash_table_remove(self->priv->touch_sequences, sequence);
+    }
 }
 
 /* Convert a logical widget coordinate or delta to the device pixels Servo uses. */
