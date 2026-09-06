@@ -283,13 +283,17 @@ enum PendingRequest {
     CreateWebView(CreateNewWebViewRequest),
 }
 
-/// A [`PendingRequest`] plus the engine-side id it arrived with, which is what
+/// A stored request plus the engine-side id it arrived with, which is what
 /// `hide_embedder_control` names when Servo withdraws it. Requests that do not
 /// come from `show_embedder_control` — authentication and permission prompts —
 /// cannot be withdrawn and carry `None`.
-struct Pending {
-    control_id: Option<EmbedderControlId>,
-    request: PendingRequest,
+///
+/// Generic over both so the registry's bookkeeping can be exercised in tests
+/// with plain values: neither `EmbedderControlId` nor any of the Servo request
+/// types can be constructed outside the engine.
+struct Pending<Id, T> {
+    control_id: Option<Id>,
+    request: T,
 }
 
 /// The requests currently awaiting an answer from the host, keyed by the id
@@ -299,15 +303,25 @@ struct Pending {
 /// a matching id rather than looking it up. The map holds at most a couple of
 /// entries in practice — script blocks on a simple dialog, so a page cannot
 /// stack them up.
-#[derive(Default)]
-struct RequestRegistry {
-    requests: RefCell<HashMap<u64, Pending>>,
+struct RequestRegistry<Id, T> {
+    requests: RefCell<HashMap<u64, Pending<Id, T>>>,
     next_id: Cell<u64>,
 }
 
-impl RequestRegistry {
+// Derived `Default` would demand `Id: Default, T: Default`, which neither the
+// Servo request types nor `EmbedderControlId` satisfy.
+impl<Id, T> Default for RequestRegistry<Id, T> {
+    fn default() -> Self {
+        Self {
+            requests: RefCell::new(HashMap::new()),
+            next_id: Cell::new(0),
+        }
+    }
+}
+
+impl<Id: Copy + PartialEq, T> RequestRegistry<Id, T> {
     /// Store `request` and return the id C should use to answer it.
-    fn insert(&self, control_id: Option<EmbedderControlId>, request: PendingRequest) -> u64 {
+    fn insert(&self, control_id: Option<Id>, request: T) -> u64 {
         let id = self.next_id.get().wrapping_add(1);
         self.next_id.set(id);
         self.requests.borrow_mut().insert(
@@ -322,7 +336,7 @@ impl RequestRegistry {
 
     /// Remove and return a request, or `None` if it was already answered or
     /// withdrawn (a host answering twice, or answering a stale id).
-    fn take(&self, id: u64) -> Option<PendingRequest> {
+    fn take(&self, id: u64) -> Option<T> {
         self.requests
             .borrow_mut()
             .remove(&id)
@@ -331,7 +345,7 @@ impl RequestRegistry {
 
     /// Remove the request carrying `control_id`, returning the id C knows it
     /// by so the withdrawal can be reported.
-    fn take_by_control_id(&self, control_id: EmbedderControlId) -> Option<u64> {
+    fn take_by_control_id(&self, control_id: Id) -> Option<u64> {
         let mut requests = self.requests.borrow_mut();
         let id = requests
             .iter()
@@ -430,7 +444,7 @@ struct EmbedderDelegate {
     create_webview_callback: RefCell<Option<CreateWebViewCallback>>,
     closed_callback: RefCell<Option<ClosedCallback>>,
     request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
-    requests: RequestRegistry,
+    requests: RequestRegistry<EmbedderControlId, PendingRequest>,
 }
 
 impl EmbedderDelegate {
@@ -1855,7 +1869,30 @@ pub unsafe extern "C" fn servo_webview_key(
         return;
     };
 
-    let logical_key = match key {
+    let logical_key = logical_key_from_abi(key, unicode);
+    let mods = modifiers_from_abi(modifiers);
+    let state = if pressed { KeyState::Down } else { KeyState::Up };
+
+    handle
+        .webview
+        .notify_input_event(InputEvent::Keyboard(KeyboardEvent::new_without_event(
+            state,
+            logical_key,
+            Code::Unidentified,
+            Location::Standard,
+            mods,
+            false, // repeat
+            false, // is_composing
+        )));
+}
+
+/// Map a `ServoKey` value plus its Unicode codepoint to a [`Key`].
+///
+/// `CHARACTER` uses the codepoint; every other value names a key directly. An
+/// unknown value, or a codepoint that is not a valid Unicode scalar, falls back
+/// to `Unidentified` rather than inventing a key.
+fn logical_key_from_abi(key: u32, unicode: u32) -> Key {
+    match key {
         servo_key::ENTER => Key::Named(NamedKey::Enter),
         servo_key::TAB => Key::Named(NamedKey::Tab),
         servo_key::BACKSPACE => Key::Named(NamedKey::Backspace),
@@ -1889,9 +1926,14 @@ pub unsafe extern "C" fn servo_webview_key(
             Some(c) if key == servo_key::CHARACTER => Key::Character(c.to_string()),
             _ => Key::Named(NamedKey::Unidentified),
         },
-    };
+    }
+}
 
+/// Map a `SERVO_MODIFIER_*` bitmask to Servo's [`Modifiers`]. Bits that are not
+/// part of the ABI are ignored.
+fn modifiers_from_abi(modifiers: u32) -> Modifiers {
     let mut mods = Modifiers::empty();
+
     if modifiers & servo_modifier::SHIFT != 0 {
         mods |= Modifiers::SHIFT;
     }
@@ -1905,19 +1947,7 @@ pub unsafe extern "C" fn servo_webview_key(
         mods |= Modifiers::META;
     }
 
-    let state = if pressed { KeyState::Down } else { KeyState::Up };
-
-    handle
-        .webview
-        .notify_input_event(InputEvent::Keyboard(KeyboardEvent::new_without_event(
-            state,
-            logical_key,
-            Code::Unidentified,
-            Location::Standard,
-            mods,
-            false, // repeat
-            false, // is_composing
-        )));
+    mods
 }
 
 /// Pump Servo's event loop once. Call this regularly from a GTK tick/timeout
@@ -2151,4 +2181,309 @@ pub unsafe extern "C" fn servo_webview_evaluate_script(
             }
         }
     });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- request registry -------------------------------------------------
+    //
+    // Exercised with plain values: neither `EmbedderControlId` nor any of the
+    // Servo request types can be constructed outside the engine.
+
+    fn registry() -> RequestRegistry<u32, &'static str> {
+        RequestRegistry::default()
+    }
+
+    #[test]
+    fn registry_round_trips_a_request() {
+        let registry = registry();
+
+        let id = registry.insert(Some(7), "dialog");
+
+        assert_eq!(registry.take(id), Some("dialog"));
+    }
+
+    #[test]
+    fn registry_hands_out_distinct_ids() {
+        let registry = registry();
+
+        let first = registry.insert(Some(1), "a");
+        let second = registry.insert(Some(2), "b");
+
+        assert_ne!(first, second);
+        assert_eq!(registry.take(first), Some("a"));
+        assert_eq!(registry.take(second), Some("b"));
+    }
+
+    #[test]
+    fn registry_never_hands_out_zero() {
+        // C has no reserved "no request" id, but starting at 1 keeps a
+        // zero-initialised id from ever naming a real request.
+        let registry = registry();
+
+        assert_ne!(registry.insert(None, "a"), 0);
+    }
+
+    #[test]
+    fn registry_answers_a_request_only_once() {
+        // A host that answers twice — a button click racing a window close —
+        // must not reach the Servo request a second time.
+        let registry = registry();
+        let id = registry.insert(Some(1), "dialog");
+
+        assert_eq!(registry.take(id), Some("dialog"));
+        assert_eq!(registry.take(id), None);
+    }
+
+    #[test]
+    fn registry_ignores_an_unknown_id() {
+        let registry = registry();
+
+        assert_eq!(registry.take(1234), None);
+    }
+
+    #[test]
+    fn registry_withdraws_by_control_id() {
+        let registry = registry();
+        let id = registry.insert(Some(42), "dialog");
+
+        assert_eq!(registry.take_by_control_id(42), Some(id));
+        // Withdrawing removed it, so answering it afterwards does nothing.
+        assert_eq!(registry.take(id), None);
+    }
+
+    #[test]
+    fn registry_withdraws_only_the_matching_request() {
+        let registry = registry();
+        let first = registry.insert(Some(1), "a");
+        let second = registry.insert(Some(2), "b");
+
+        assert_eq!(registry.take_by_control_id(2), Some(second));
+        assert_eq!(registry.take(first), Some("a"));
+    }
+
+    #[test]
+    fn registry_cannot_withdraw_a_request_with_no_control_id() {
+        // Authentication and permission prompts do not come from
+        // `show_embedder_control`, so Servo can never withdraw them.
+        let registry = registry();
+        let id = registry.insert(None, "auth");
+
+        assert_eq!(registry.take_by_control_id(0), None);
+        assert_eq!(registry.take(id), Some("auth"));
+    }
+
+    // ---- keyboard ---------------------------------------------------------
+
+    #[test]
+    fn character_keys_use_the_codepoint() {
+        assert_eq!(
+            logical_key_from_abi(servo_key::CHARACTER, 'a' as u32),
+            Key::Character("a".to_string())
+        );
+        // Outside the BMP, to catch a codepoint truncated to 16 bits.
+        assert_eq!(
+            logical_key_from_abi(servo_key::CHARACTER, 0x1F600),
+            Key::Character("\u{1F600}".to_string())
+        );
+    }
+
+    #[test]
+    fn named_keys_ignore_the_codepoint() {
+        // Enter has a Unicode mapping of its own; the named key must win, or
+        // pressing it would type a control character.
+        assert_eq!(
+            logical_key_from_abi(servo_key::ENTER, '\r' as u32),
+            Key::Named(NamedKey::Enter)
+        );
+        assert_eq!(
+            logical_key_from_abi(servo_key::F1, 0),
+            Key::Named(NamedKey::F1)
+        );
+        assert_eq!(
+            logical_key_from_abi(servo_key::INSERT, 0),
+            Key::Named(NamedKey::Insert)
+        );
+        assert_eq!(
+            logical_key_from_abi(servo_key::PAGE_DOWN, 0),
+            Key::Named(NamedKey::PageDown)
+        );
+    }
+
+    #[test]
+    fn every_named_key_in_the_abi_maps_to_a_named_key() {
+        // Guards against a value being added to the C enum without a match arm,
+        // which would silently degrade that key to Unidentified.
+        for key in [
+            servo_key::ENTER,
+            servo_key::TAB,
+            servo_key::BACKSPACE,
+            servo_key::DELETE,
+            servo_key::ESCAPE,
+            servo_key::ARROW_LEFT,
+            servo_key::ARROW_RIGHT,
+            servo_key::ARROW_UP,
+            servo_key::ARROW_DOWN,
+            servo_key::HOME,
+            servo_key::END,
+            servo_key::PAGE_UP,
+            servo_key::PAGE_DOWN,
+            servo_key::INSERT,
+            servo_key::F1,
+            servo_key::F2,
+            servo_key::F3,
+            servo_key::F4,
+            servo_key::F5,
+            servo_key::F6,
+            servo_key::F7,
+            servo_key::F8,
+            servo_key::F9,
+            servo_key::F10,
+            servo_key::F11,
+            servo_key::F12,
+        ] {
+            let mapped = logical_key_from_abi(key, 0);
+            assert!(
+                matches!(mapped, Key::Named(named) if named != NamedKey::Unidentified),
+                "ServoKey {key} mapped to {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_key_values_are_unidentified() {
+        assert_eq!(
+            logical_key_from_abi(servo_key::UNIDENTIFIED, 0),
+            Key::Named(NamedKey::Unidentified)
+        );
+        // A value from a newer library this build knows nothing about.
+        assert_eq!(
+            logical_key_from_abi(9999, 0),
+            Key::Named(NamedKey::Unidentified)
+        );
+    }
+
+    #[test]
+    fn an_invalid_codepoint_is_unidentified_rather_than_a_character() {
+        // A lone surrogate is not a Unicode scalar value.
+        assert_eq!(
+            logical_key_from_abi(servo_key::CHARACTER, 0xD800),
+            Key::Named(NamedKey::Unidentified)
+        );
+        assert_eq!(
+            logical_key_from_abi(servo_key::CHARACTER, 0x11_0000),
+            Key::Named(NamedKey::Unidentified)
+        );
+    }
+
+    #[test]
+    fn modifiers_map_individually_and_together() {
+        assert_eq!(modifiers_from_abi(0), Modifiers::empty());
+        assert_eq!(modifiers_from_abi(servo_modifier::SHIFT), Modifiers::SHIFT);
+        assert_eq!(
+            modifiers_from_abi(servo_modifier::CONTROL),
+            Modifiers::CONTROL
+        );
+        assert_eq!(modifiers_from_abi(servo_modifier::ALT), Modifiers::ALT);
+        assert_eq!(modifiers_from_abi(servo_modifier::META), Modifiers::META);
+        assert_eq!(
+            modifiers_from_abi(servo_modifier::SHIFT | servo_modifier::CONTROL),
+            Modifiers::SHIFT | Modifiers::CONTROL
+        );
+    }
+
+    #[test]
+    fn unknown_modifier_bits_are_ignored() {
+        assert_eq!(
+            modifiers_from_abi(servo_modifier::SHIFT | 1 << 20),
+            Modifiers::SHIFT
+        );
+    }
+
+    // ---- enum mappings ----------------------------------------------------
+
+    #[test]
+    fn load_status_maps_to_the_abi() {
+        assert_eq!(
+            load_status_to_abi(LoadStatus::Started),
+            servo_load_status::STARTED
+        );
+        assert_eq!(
+            load_status_to_abi(LoadStatus::HeadParsed),
+            servo_load_status::HEAD_PARSED
+        );
+        assert_eq!(
+            load_status_to_abi(LoadStatus::Complete),
+            servo_load_status::COMPLETE
+        );
+    }
+
+    #[test]
+    fn permission_features_map_to_distinct_abi_values() {
+        let features = [
+            PermissionFeature::Geolocation,
+            PermissionFeature::Notifications,
+            PermissionFeature::Push,
+            PermissionFeature::Midi,
+            PermissionFeature::Camera,
+            PermissionFeature::Microphone,
+            PermissionFeature::Speaker,
+            PermissionFeature::DeviceInfo,
+            PermissionFeature::BackgroundSync,
+            PermissionFeature::Bluetooth,
+            PermissionFeature::PersistentStorage,
+            PermissionFeature::ScreenWakeLock,
+        ];
+
+        let mapped: Vec<u32> = features.iter().map(|f| permission_feature_to_abi(*f)).collect();
+        let mut sorted = mapped.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        // Two features collapsing onto one value would let a host grant the
+        // wrong capability.
+        assert_eq!(sorted.len(), features.len());
+        assert_eq!(
+            permission_feature_to_abi(PermissionFeature::Camera),
+            servo_permission::CAMERA
+        );
+    }
+
+    #[test]
+    fn context_menu_actions_map_to_distinct_abi_values() {
+        let actions = [
+            ContextMenuAction::GoBack,
+            ContextMenuAction::GoForward,
+            ContextMenuAction::Reload,
+            ContextMenuAction::CopyLink,
+            ContextMenuAction::OpenLinkInNewWebView,
+            ContextMenuAction::CopyImageLink,
+            ContextMenuAction::OpenImageInNewView,
+            ContextMenuAction::Cut,
+            ContextMenuAction::Copy,
+            ContextMenuAction::Paste,
+            ContextMenuAction::SelectAll,
+        ];
+
+        let mut mapped: Vec<u32> = actions.iter().map(|a| context_menu_action_to_abi(*a)).collect();
+        mapped.sort_unstable();
+        mapped.dedup();
+
+        assert_eq!(mapped.len(), actions.len());
+    }
+
+    #[test]
+    fn cursor_names_are_valid_css_keywords() {
+        // The GTK side feeds these straight to gtk_widget_set_cursor_from_name,
+        // so an empty or stray-whitespace name would silently do nothing.
+        for cursor in [Cursor::Default, Cursor::Pointer, Cursor::Text, Cursor::Wait] {
+            let name = cursor_css_name(cursor);
+            assert!(!name.is_empty(), "{cursor:?} has an empty name");
+            assert_eq!(name.trim(), name, "{cursor:?} has padded whitespace");
+        }
+        assert_eq!(cursor_css_name(Cursor::Pointer), "pointer");
+    }
 }
