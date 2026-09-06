@@ -118,7 +118,20 @@ typedef enum {
     SERVO_KEY_HOME = 11,
     SERVO_KEY_END = 12,
     SERVO_KEY_PAGE_UP = 13,
-    SERVO_KEY_PAGE_DOWN = 14
+    SERVO_KEY_PAGE_DOWN = 14,
+    SERVO_KEY_INSERT = 15,
+    SERVO_KEY_F1 = 16,
+    SERVO_KEY_F2 = 17,
+    SERVO_KEY_F3 = 18,
+    SERVO_KEY_F4 = 19,
+    SERVO_KEY_F5 = 20,
+    SERVO_KEY_F6 = 21,
+    SERVO_KEY_F7 = 22,
+    SERVO_KEY_F8 = 23,
+    SERVO_KEY_F9 = 24,
+    SERVO_KEY_F10 = 25,
+    SERVO_KEY_F11 = 26,
+    SERVO_KEY_F12 = 27
 } ServoKey;
 
 /* Modifier bitmask for servo_webview_key(). */

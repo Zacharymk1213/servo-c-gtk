@@ -358,6 +358,20 @@ servo_gtk_web_view_map_keyval(guint keyval)
     case GDK_KEY_KP_Page_Up:     return SERVO_KEY_PAGE_UP;
     case GDK_KEY_Page_Down:
     case GDK_KEY_KP_Page_Down:   return SERVO_KEY_PAGE_DOWN;
+    case GDK_KEY_Insert:
+    case GDK_KEY_KP_Insert:      return SERVO_KEY_INSERT;
+    case GDK_KEY_F1:             return SERVO_KEY_F1;
+    case GDK_KEY_F2:             return SERVO_KEY_F2;
+    case GDK_KEY_F3:             return SERVO_KEY_F3;
+    case GDK_KEY_F4:             return SERVO_KEY_F4;
+    case GDK_KEY_F5:             return SERVO_KEY_F5;
+    case GDK_KEY_F6:             return SERVO_KEY_F6;
+    case GDK_KEY_F7:             return SERVO_KEY_F7;
+    case GDK_KEY_F8:             return SERVO_KEY_F8;
+    case GDK_KEY_F9:             return SERVO_KEY_F9;
+    case GDK_KEY_F10:            return SERVO_KEY_F10;
+    case GDK_KEY_F11:            return SERVO_KEY_F11;
+    case GDK_KEY_F12:            return SERVO_KEY_F12;
     default:                     return SERVO_KEY_CHARACTER;
     }
 }
@@ -378,8 +392,9 @@ servo_gtk_web_view_key(GtkWidget *widget, GdkEventKey *event, gboolean pressed)
     if (key == SERVO_KEY_CHARACTER) {
         unicode = gdk_keyval_to_unicode(event->keyval);
         /*
-         * Bare modifiers and function keys have no Unicode mapping; report them
-         * as unidentified rather than as an empty character.
+         * Bare modifiers (Shift, Control, ...) have no Unicode mapping; report
+         * them as unidentified rather than as an empty character. Function keys
+         * and Insert are already handled as named keys above.
          */
         if (unicode == 0) {
             key = SERVO_KEY_UNIDENTIFIED;

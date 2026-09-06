@@ -584,6 +584,19 @@ mod servo_key {
     pub const END: u32 = 12;
     pub const PAGE_UP: u32 = 13;
     pub const PAGE_DOWN: u32 = 14;
+    pub const INSERT: u32 = 15;
+    pub const F1: u32 = 16;
+    pub const F2: u32 = 17;
+    pub const F3: u32 = 18;
+    pub const F4: u32 = 19;
+    pub const F5: u32 = 20;
+    pub const F6: u32 = 21;
+    pub const F7: u32 = 22;
+    pub const F8: u32 = 23;
+    pub const F9: u32 = 24;
+    pub const F10: u32 = 25;
+    pub const F11: u32 = 26;
+    pub const F12: u32 = 27;
 }
 
 /// Modifier bits understood by [`servo_webview_key`]. Mirrors the
@@ -632,6 +645,19 @@ pub unsafe extern "C" fn servo_webview_key(
         servo_key::END => Key::Named(NamedKey::End),
         servo_key::PAGE_UP => Key::Named(NamedKey::PageUp),
         servo_key::PAGE_DOWN => Key::Named(NamedKey::PageDown),
+        servo_key::INSERT => Key::Named(NamedKey::Insert),
+        servo_key::F1 => Key::Named(NamedKey::F1),
+        servo_key::F2 => Key::Named(NamedKey::F2),
+        servo_key::F3 => Key::Named(NamedKey::F3),
+        servo_key::F4 => Key::Named(NamedKey::F4),
+        servo_key::F5 => Key::Named(NamedKey::F5),
+        servo_key::F6 => Key::Named(NamedKey::F6),
+        servo_key::F7 => Key::Named(NamedKey::F7),
+        servo_key::F8 => Key::Named(NamedKey::F8),
+        servo_key::F9 => Key::Named(NamedKey::F9),
+        servo_key::F10 => Key::Named(NamedKey::F10),
+        servo_key::F11 => Key::Named(NamedKey::F11),
+        servo_key::F12 => Key::Named(NamedKey::F12),
         servo_key::UNIDENTIFIED => Key::Named(NamedKey::Unidentified),
         // CHARACTER (and any unknown value) falls back to the codepoint, then
         // to Unidentified if it isn't a valid scalar value.
