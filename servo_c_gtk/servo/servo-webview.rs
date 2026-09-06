@@ -26,7 +26,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::Once;
 
-use euclid::Point2D;
+use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
     Key, KeyState, KeyboardEvent, Location, Modifiers, MouseButton, MouseButtonAction,
@@ -485,6 +485,31 @@ pub unsafe extern "C" fn servo_webview_resize(
         handle
             .webview
             .resize(dpi::PhysicalSize::new(width.max(1), height.max(1)));
+    }
+}
+
+/// Set the HiDPI scale factor: the number of device pixels per
+/// device-independent (logical) pixel, e.g. `2.0` on a doubled display.
+///
+/// The surface size passed to [`servo_webview_new`] and [`servo_webview_resize`]
+/// is always in *device* pixels; this scale is what tells the page how large a
+/// CSS pixel is, so `window.devicePixelRatio`, media queries and layout come
+/// out right instead of the page being laid out at half size and upscaled.
+///
+/// Non-finite or non-positive values are ignored.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_hidpi_scale_factor(
+    webview: *mut ServoWebViewHandle,
+    scale: f32,
+) {
+    if !scale.is_finite() || scale <= 0.0 {
+        return;
+    }
+    if let Some(handle) = unsafe { as_handle(webview) } {
+        handle.webview.set_hidpi_scale_factor(Scale::new(scale));
     }
 }
 

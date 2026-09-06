@@ -194,8 +194,28 @@ servo_gtk_web_view_draw(GtkWidget *widget, cairo_t *cr)
     ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
 
     if (self->frame != NULL) {
+        int width = gtk_widget_get_allocated_width(widget);
+        int height = gtk_widget_get_allocated_height(widget);
+        int frame_width = gdk_pixbuf_get_width(self->frame);
+        int frame_height = gdk_pixbuf_get_height(self->frame);
+
+        /*
+         * Servo renders at device resolution while cairo draws in logical
+         * units, so on a HiDPI display the frame is larger than the widget.
+         * Scaling by the measured ratio rather than by the scale factor also
+         * stretches a frame that is still at the pre-resize size, instead of
+         * painting it 1:1 in a corner until the next one arrives.
+         */
+        cairo_save(cr);
+        if (frame_width > 0 && frame_height > 0 &&
+            (frame_width != width || frame_height != height)) {
+            cairo_scale(cr,
+                        (double) width / frame_width,
+                        (double) height / frame_height);
+        }
         gdk_cairo_set_source_pixbuf(cr, self->frame, 0, 0);
         cairo_paint(cr);
+        cairo_restore(cr);
     } else {
         /* No frame yet: paint a neutral background. */
         cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
@@ -203,6 +223,43 @@ servo_gtk_web_view_draw(GtkWidget *widget, cairo_t *cr)
     }
 
     return FALSE;
+}
+
+/*
+ * Create the Servo instance on first use, or resize it, for a widget whose
+ * logical size is width x height. Servo's surface is sized in device pixels, so
+ * the logical size is multiplied by the widget's scale factor and that same
+ * factor is handed to Servo as the HiDPI scale — otherwise the page would be
+ * laid out at logical size and merely upscaled, and window.devicePixelRatio
+ * would be wrong.
+ */
+static void
+servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
+{
+    int   scale = MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(self)));
+    guint w = (guint) MAX(1, width) * (guint) scale;
+    guint h = (guint) MAX(1, height) * (guint) scale;
+
+    if (self->servo == NULL) {
+        /*
+         * Pass any URI requested before allocation as the initial URL: Servo
+         * creates the browsing context together with it. Issuing a separate
+         * load here instead would race the context's creation and be dropped.
+         */
+        self->servo = servo_webview_new(w, h, self->uri);
+        if (self->servo != NULL) {
+            servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
+            servo_webview_set_frame_ready_callback(
+                self->servo, servo_gtk_web_view_on_frame_ready, self);
+            servo_webview_set_cursor_changed_callback(
+                self->servo, servo_gtk_web_view_on_cursor_changed, self);
+            servo_webview_set_url_changed_callback(
+                self->servo, servo_gtk_web_view_on_url_changed, self);
+        }
+    } else {
+        servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
+        servo_webview_resize(self->servo, w, h);
+    }
 }
 
 /*
@@ -214,28 +271,41 @@ servo_gtk_web_view_size_allocate(GtkWidget *widget, GtkAllocation *allocation)
 {
     GTK_WIDGET_CLASS(servo_gtk_web_view_parent_class)->size_allocate(widget, allocation);
 
-    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
-    guint width  = (guint) MAX(1, allocation->width);
-    guint height = (guint) MAX(1, allocation->height);
+    servo_gtk_web_view_sync_surface(
+        SERVO_GTK_WEB_VIEW(widget), allocation->width, allocation->height);
+}
 
+/*
+ * The widget moved to a monitor with a different scale factor. The logical
+ * allocation is unchanged, so size_allocate does not run; re-sync the surface
+ * so Servo renders at the new device resolution.
+ */
+static void
+servo_gtk_web_view_on_scale_factor_changed(GObject    *object,
+                                           GParamSpec *pspec,
+                                           gpointer    user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(object);
+    GtkWidget       *widget = GTK_WIDGET(self);
+
+    (void) pspec;
+    (void) user_data;
+
+    /* Not allocated yet: the first size_allocate will pick the scale factor up. */
     if (self->servo == NULL) {
-        /*
-         * Pass any URI requested before allocation as the initial URL: Servo
-         * creates the browsing context together with it. Issuing a separate
-         * load here instead would race the context's creation and be dropped.
-         */
-        self->servo = servo_webview_new(width, height, self->uri);
-        if (self->servo != NULL) {
-            servo_webview_set_frame_ready_callback(
-                self->servo, servo_gtk_web_view_on_frame_ready, self);
-            servo_webview_set_cursor_changed_callback(
-                self->servo, servo_gtk_web_view_on_cursor_changed, self);
-            servo_webview_set_url_changed_callback(
-                self->servo, servo_gtk_web_view_on_url_changed, self);
-        }
-    } else {
-        servo_webview_resize(self->servo, width, height);
+        return;
     }
+
+    servo_gtk_web_view_sync_surface(self,
+                                    gtk_widget_get_allocated_width(widget),
+                                    gtk_widget_get_allocated_height(widget));
+}
+
+/* Convert a logical widget coordinate or delta to the device pixels Servo uses. */
+static double
+servo_gtk_web_view_to_device(ServoGtkWebView *self, double value)
+{
+    return value * MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(self)));
 }
 
 static gboolean
@@ -244,7 +314,9 @@ servo_gtk_web_view_motion_notify(GtkWidget *widget, GdkEventMotion *event)
     ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
 
     if (self->servo != NULL) {
-        servo_webview_pointer_move(self->servo, event->x, event->y);
+        servo_webview_pointer_move(self->servo,
+                                   servo_gtk_web_view_to_device(self, event->x),
+                                   servo_gtk_web_view_to_device(self, event->y));
     }
 
     return TRUE;
@@ -258,7 +330,11 @@ servo_gtk_web_view_button_press(GtkWidget *widget, GdkEventButton *event)
     gtk_widget_grab_focus(widget);
 
     if (self->servo != NULL) {
-        servo_webview_pointer_button(self->servo, event->button, TRUE, event->x, event->y);
+        servo_webview_pointer_button(self->servo,
+                                     event->button,
+                                     TRUE,
+                                     servo_gtk_web_view_to_device(self, event->x),
+                                     servo_gtk_web_view_to_device(self, event->y));
     }
 
     return TRUE;
@@ -270,7 +346,11 @@ servo_gtk_web_view_button_release(GtkWidget *widget, GdkEventButton *event)
     ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
 
     if (self->servo != NULL) {
-        servo_webview_pointer_button(self->servo, event->button, FALSE, event->x, event->y);
+        servo_webview_pointer_button(self->servo,
+                                     event->button,
+                                     FALSE,
+                                     servo_gtk_web_view_to_device(self, event->x),
+                                     servo_gtk_web_view_to_device(self, event->y));
     }
 
     return TRUE;
@@ -294,7 +374,9 @@ servo_gtk_web_view_scroll(GtkWidget *widget, GdkEventScroll *event)
     }
 
     if (self->servo != NULL) {
-        servo_webview_scroll(self->servo, dx, dy);
+        servo_webview_scroll(self->servo,
+                             servo_gtk_web_view_to_device(self, dx),
+                             servo_gtk_web_view_to_device(self, dy));
     }
 
     return TRUE;
@@ -481,6 +563,12 @@ servo_gtk_web_view_init(ServoGtkWebView *self)
     GtkWidget *widget = GTK_WIDGET(self);
 
     gtk_widget_set_can_focus(widget, TRUE);
+
+    g_signal_connect(self,
+                     "notify::scale-factor",
+                     G_CALLBACK(servo_gtk_web_view_on_scale_factor_changed),
+                     NULL);
+
     gtk_widget_add_events(
         widget,
         GDK_POINTER_MOTION_MASK

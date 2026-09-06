@@ -67,6 +67,11 @@ servo_webview_resize(ServoWebViewHandle *webview, uint32_t width, uint32_t heigh
     (void) webview; (void) width; (void) height;
 }
 
+void servo_webview_set_hidpi_scale_factor(ServoWebViewHandle *webview, float scale)
+{
+    (void) webview; (void) scale;
+}
+
 void servo_webview_pointer_move(ServoWebViewHandle *webview, double x, double y)
 {
     (void) webview; (void) x; (void) y;

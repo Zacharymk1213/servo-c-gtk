@@ -87,6 +87,16 @@ void servo_webview_resize(ServoWebViewHandle *webview,
                           uint32_t            width,
                           uint32_t            height);
 
+/*
+ * Device pixels per logical (device-independent) pixel, e.g. 2.0 on a doubled
+ * display. The surface size above is always in device pixels; this is what
+ * tells the page how large a CSS pixel is, so window.devicePixelRatio, media
+ * queries and layout come out right rather than the page being laid out at
+ * half size and upscaled. Non-finite or non-positive values are ignored.
+ */
+void servo_webview_set_hidpi_scale_factor(ServoWebViewHandle *webview,
+                                          float               scale);
+
 /* Input. `button`: 1 = left, 2 = middle, 3 = right (GDK numbering). */
 void servo_webview_pointer_move(ServoWebViewHandle *webview, double x, double y);
 void servo_webview_pointer_button(ServoWebViewHandle *webview,

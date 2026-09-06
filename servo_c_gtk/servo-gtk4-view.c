@@ -196,13 +196,29 @@ servo_gtk_web_view_draw(GtkDrawingArea *area,
 {
     ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(area);
 
-    (void) width;
-    (void) height;
     (void) user_data;
 
     if (self->frame != NULL) {
+        int frame_width = gdk_pixbuf_get_width(self->frame);
+        int frame_height = gdk_pixbuf_get_height(self->frame);
+
+        /*
+         * Servo renders at device resolution while cairo draws in logical
+         * units, so on a HiDPI display the frame is larger than the widget.
+         * Scaling by the measured ratio rather than by the scale factor also
+         * stretches a frame that is still at the pre-resize size, instead of
+         * painting it 1:1 in a corner until the next one arrives.
+         */
+        cairo_save(cr);
+        if (frame_width > 0 && frame_height > 0 &&
+            (frame_width != width || frame_height != height)) {
+            cairo_scale(cr,
+                        (double) width / frame_width,
+                        (double) height / frame_height);
+        }
         gdk_cairo_set_source_pixbuf(cr, self->frame, 0, 0);
         cairo_paint(cr);
+        cairo_restore(cr);
     } else {
         /* No frame yet: paint a neutral background. */
         cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
@@ -211,21 +227,19 @@ servo_gtk_web_view_draw(GtkDrawingArea *area,
 }
 
 /*
- * GtkDrawingArea::resize (GTK4) reports the widget's new size. The Servo
- * instance is created lazily on the first resize, when the real widget size is
- * known, and resized on subsequent ones.
+ * Create the Servo instance on first use, or resize it, for a widget whose
+ * logical size is width x height. Servo's surface is sized in device pixels, so
+ * the logical size is multiplied by the widget's scale factor and that same
+ * factor is handed to Servo as the HiDPI scale — otherwise the page would be
+ * laid out at logical size and merely upscaled, and window.devicePixelRatio
+ * would be wrong.
  */
 static void
-servo_gtk_web_view_on_resize(GtkDrawingArea *area,
-                             int             width,
-                             int             height,
-                             gpointer        user_data)
+servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
 {
-    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(area);
-    guint w = (guint) MAX(1, width);
-    guint h = (guint) MAX(1, height);
-
-    (void) user_data;
+    int   scale = MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(self)));
+    guint w = (guint) MAX(1, width) * (guint) scale;
+    guint h = (guint) MAX(1, height) * (guint) scale;
 
     if (self->servo == NULL) {
         /*
@@ -235,6 +249,7 @@ servo_gtk_web_view_on_resize(GtkDrawingArea *area,
          */
         self->servo = servo_webview_new(w, h, self->uri);
         if (self->servo != NULL) {
+            servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
             servo_webview_set_frame_ready_callback(
                 self->servo, servo_gtk_web_view_on_frame_ready, self);
             servo_webview_set_cursor_changed_callback(
@@ -243,8 +258,57 @@ servo_gtk_web_view_on_resize(GtkDrawingArea *area,
                 self->servo, servo_gtk_web_view_on_url_changed, self);
         }
     } else {
+        servo_webview_set_hidpi_scale_factor(self->servo, (float) scale);
         servo_webview_resize(self->servo, w, h);
     }
+}
+
+/*
+ * GtkDrawingArea::resize (GTK4) reports the widget's new logical size. The
+ * Servo instance is created lazily here, on the first resize, when the real
+ * widget size is known.
+ */
+static void
+servo_gtk_web_view_on_resize(GtkDrawingArea *area,
+                             int             width,
+                             int             height,
+                             gpointer        user_data)
+{
+    (void) user_data;
+
+    servo_gtk_web_view_sync_surface(SERVO_GTK_WEB_VIEW(area), width, height);
+}
+
+/*
+ * The widget moved to a display with a different scale factor. The logical size
+ * is unchanged, so ::resize does not fire; re-sync the surface so Servo renders
+ * at the new device resolution.
+ */
+static void
+servo_gtk_web_view_on_scale_factor_changed(GObject    *object,
+                                           GParamSpec *pspec,
+                                           gpointer    user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(object);
+    GtkWidget       *widget = GTK_WIDGET(self);
+
+    (void) pspec;
+    (void) user_data;
+
+    /* Not allocated yet: the first ::resize will pick the scale factor up. */
+    if (self->servo == NULL) {
+        return;
+    }
+
+    servo_gtk_web_view_sync_surface(
+        self, gtk_widget_get_width(widget), gtk_widget_get_height(widget));
+}
+
+/* Convert a logical widget coordinate or delta to the device pixels Servo uses. */
+static double
+servo_gtk_web_view_to_device(ServoGtkWebView *self, double value)
+{
+    return value * MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(self)));
 }
 
 /* GtkEventControllerMotion::motion: forward the pointer position to Servo. */
@@ -259,7 +323,9 @@ servo_gtk_web_view_on_motion(GtkEventControllerMotion *controller,
     (void) controller;
 
     if (self->servo != NULL) {
-        servo_webview_pointer_move(self->servo, x, y);
+        servo_webview_pointer_move(self->servo,
+                                   servo_gtk_web_view_to_device(self, x),
+                                   servo_gtk_web_view_to_device(self, y));
     }
 }
 
@@ -279,7 +345,11 @@ servo_gtk_web_view_on_pressed(GtkGestureClick *gesture,
 
     if (self->servo != NULL) {
         guint button = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
-        servo_webview_pointer_button(self->servo, button, TRUE, x, y);
+        servo_webview_pointer_button(self->servo,
+                                     button,
+                                     TRUE,
+                                     servo_gtk_web_view_to_device(self, x),
+                                     servo_gtk_web_view_to_device(self, y));
     }
 }
 
@@ -297,7 +367,11 @@ servo_gtk_web_view_on_released(GtkGestureClick *gesture,
 
     if (self->servo != NULL) {
         guint button = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
-        servo_webview_pointer_button(self->servo, button, FALSE, x, y);
+        servo_webview_pointer_button(self->servo,
+                                     button,
+                                     FALSE,
+                                     servo_gtk_web_view_to_device(self, x),
+                                     servo_gtk_web_view_to_device(self, y));
     }
 }
 
@@ -317,7 +391,9 @@ servo_gtk_web_view_on_scroll(GtkEventControllerScroll *controller,
     (void) controller;
 
     if (self->servo != NULL) {
-        servo_webview_scroll(self->servo, dx, dy);
+        servo_webview_scroll(self->servo,
+                             servo_gtk_web_view_to_device(self, dx),
+                             servo_gtk_web_view_to_device(self, dy));
     }
 
     return TRUE;
@@ -522,6 +598,10 @@ servo_gtk_web_view_init(ServoGtkWebView *self)
 
     /* Lazily create/resize the Servo instance as the widget is allocated. */
     g_signal_connect(self, "resize", G_CALLBACK(servo_gtk_web_view_on_resize), NULL);
+    g_signal_connect(self,
+                     "notify::scale-factor",
+                     G_CALLBACK(servo_gtk_web_view_on_scale_factor_changed),
+                     NULL);
 
     /*
      * GTK4 delivers input through event controllers rather than event masks and
