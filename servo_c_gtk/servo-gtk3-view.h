@@ -56,6 +56,42 @@ typedef enum {
 
 GType servo_gtk_script_dialog_type_get_type (void) G_GNUC_CONST;
 
+/**
+ * ServoGtkPermissionFeature:
+ * @SERVO_GTK_PERMISSION_GEOLOCATION: the Geolocation API
+ * @SERVO_GTK_PERMISSION_NOTIFICATIONS: desktop notifications
+ * @SERVO_GTK_PERMISSION_PUSH: the Push API
+ * @SERVO_GTK_PERMISSION_MIDI: MIDI device access
+ * @SERVO_GTK_PERMISSION_CAMERA: camera capture
+ * @SERVO_GTK_PERMISSION_MICROPHONE: microphone capture
+ * @SERVO_GTK_PERMISSION_SPEAKER: speaker selection
+ * @SERVO_GTK_PERMISSION_DEVICE_INFO: enumerating media devices
+ * @SERVO_GTK_PERMISSION_BACKGROUND_SYNC: the Background Sync API
+ * @SERVO_GTK_PERMISSION_BLUETOOTH: Web Bluetooth
+ * @SERVO_GTK_PERMISSION_PERSISTENT_STORAGE: persistent storage
+ * @SERVO_GTK_PERMISSION_SCREEN_WAKE_LOCK: the Screen Wake Lock API
+ *
+ * The capability a page asked for in #ServoGtkWebView::permission-request.
+ */
+typedef enum {
+    SERVO_GTK_PERMISSION_GEOLOCATION,
+    SERVO_GTK_PERMISSION_NOTIFICATIONS,
+    SERVO_GTK_PERMISSION_PUSH,
+    SERVO_GTK_PERMISSION_MIDI,
+    SERVO_GTK_PERMISSION_CAMERA,
+    SERVO_GTK_PERMISSION_MICROPHONE,
+    SERVO_GTK_PERMISSION_SPEAKER,
+    SERVO_GTK_PERMISSION_DEVICE_INFO,
+    SERVO_GTK_PERMISSION_BACKGROUND_SYNC,
+    SERVO_GTK_PERMISSION_BLUETOOTH,
+    SERVO_GTK_PERMISSION_PERSISTENT_STORAGE,
+    SERVO_GTK_PERMISSION_SCREEN_WAKE_LOCK
+} ServoGtkPermissionFeature;
+
+#define SERVO_GTK_TYPE_PERMISSION_FEATURE      (servo_gtk_permission_feature_get_type ())
+
+GType servo_gtk_permission_feature_get_type (void) G_GNUC_CONST;
+
 typedef struct _ServoGtkWebView              ServoGtkWebView;
 typedef struct _ServoGtkWebViewPrivate       ServoGtkWebViewPrivate;
 typedef struct _ServoGtkWebViewClass         ServoGtkWebViewClass;
@@ -96,6 +132,13 @@ struct _ServoGtkWebViewClass {
                                   const gchar *const *filter_patterns,
                                   gboolean            allow_multiple,
                                   guint64             request_id);
+    gboolean (*authenticate) (ServoGtkWebView *web_view,
+                              const gchar     *uri,
+                              gboolean         for_proxy,
+                              guint64          request_id);
+    gboolean (*permission_request) (ServoGtkWebView           *web_view,
+                                    ServoGtkPermissionFeature  feature,
+                                    guint64                    request_id);
 
     /*
      * Padding for future expansion. The original four slots were consumed by
@@ -242,6 +285,40 @@ void servo_gtk_web_view_respond_to_dialog(ServoGtkWebView *self,
 void servo_gtk_web_view_respond_to_file_chooser(ServoGtkWebView    *self,
                                                 guint64             request_id,
                                                 const gchar *const *paths);
+
+/**
+ * servo_gtk_web_view_respond_to_authentication:
+ * @self: a #ServoGtkWebView
+ * @request_id: the id from the #ServoGtkWebView::authenticate emission
+ * @username: (nullable): the username to authenticate with
+ * @password: (nullable): the password to authenticate with
+ *
+ * Answers an authentication challenge reported by
+ * #ServoGtkWebView::authenticate. Passing %NULL for either @username or
+ * @password declines to supply credentials and the load fails as
+ * unauthenticated.
+ *
+ * Only needed by a handler that returned %TRUE to prompt for credentials
+ * itself — the built-in prompt answers on its own.
+ */
+void servo_gtk_web_view_respond_to_authentication(ServoGtkWebView *self,
+                                                  guint64          request_id,
+                                                  const gchar     *username,
+                                                  const gchar     *password);
+
+/**
+ * servo_gtk_web_view_respond_to_permission_request:
+ * @self: a #ServoGtkWebView
+ * @request_id: the id from the #ServoGtkWebView::permission-request emission
+ * @allowed: %TRUE to grant the capability, %FALSE to refuse it
+ *
+ * Answers a permission request reported by
+ * #ServoGtkWebView::permission-request. A request that is never answered is
+ * denied.
+ */
+void servo_gtk_web_view_respond_to_permission_request(ServoGtkWebView *self,
+                                                      guint64          request_id,
+                                                      gboolean         allowed);
 
 /**
  * servo_gtk_web_view_reload:

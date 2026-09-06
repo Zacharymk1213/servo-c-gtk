@@ -118,6 +118,39 @@ servo_webview_file_picker_respond(ServoWebViewHandle *webview,
     (void) webview; (void) request_id; (void) paths; (void) path_count;
 }
 
+void
+servo_webview_set_authentication_callback(ServoWebViewHandle         *webview,
+                                          ServoAuthenticationCallback callback,
+                                          void                       *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_set_permission_callback(ServoWebViewHandle     *webview,
+                                      ServoPermissionCallback callback,
+                                      void                   *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_authentication_respond(ServoWebViewHandle *webview,
+                                     uint64_t            request_id,
+                                     const char         *username,
+                                     const char         *password)
+{
+    (void) webview; (void) request_id; (void) username; (void) password;
+}
+
+void
+servo_webview_permission_respond(ServoWebViewHandle *webview,
+                                 uint64_t            request_id,
+                                 bool                allowed)
+{
+    (void) webview; (void) request_id; (void) allowed;
+}
+
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri)
 {
     (void) webview; (void) uri;

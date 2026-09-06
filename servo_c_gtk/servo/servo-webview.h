@@ -119,6 +119,46 @@ typedef void (*ServoFilePickerCallback)(uint64_t           request_id,
                                         void              *user_data);
 
 /*
+ * Invoked when a server or proxy issues an HTTP authentication challenge. The
+ * request is NOT answered when this returns: prompt for credentials and call
+ * servo_webview_authentication_respond() with `request_id`.
+ *
+ * `url` is the URL that triggered the challenge, valid only for the duration of
+ * the call. `for_proxy` distinguishes a proxy challenge from an origin one; the
+ * two must not be confused, since credentials for one are not credentials for
+ * the other.
+ */
+typedef void (*ServoAuthenticationCallback)(uint64_t    request_id,
+                                            const char *url,
+                                            bool        for_proxy,
+                                            void       *user_data);
+
+/* A permission-gated capability a page has asked for. */
+typedef enum {
+    SERVO_PERMISSION_GEOLOCATION = 0,
+    SERVO_PERMISSION_NOTIFICATIONS = 1,
+    SERVO_PERMISSION_PUSH = 2,
+    SERVO_PERMISSION_MIDI = 3,
+    SERVO_PERMISSION_CAMERA = 4,
+    SERVO_PERMISSION_MICROPHONE = 5,
+    SERVO_PERMISSION_SPEAKER = 6,
+    SERVO_PERMISSION_DEVICE_INFO = 7,
+    SERVO_PERMISSION_BACKGROUND_SYNC = 8,
+    SERVO_PERMISSION_BLUETOOTH = 9,
+    SERVO_PERMISSION_PERSISTENT_STORAGE = 10,
+    SERVO_PERMISSION_SCREEN_WAKE_LOCK = 11
+} ServoPermissionFeature;
+
+/*
+ * Invoked when a page asks for a permission-gated capability. The request is
+ * NOT answered when this returns; call servo_webview_permission_respond() with
+ * `request_id`. Never answering denies the request.
+ */
+typedef void (*ServoPermissionCallback)(uint64_t request_id,
+                                        uint32_t feature,
+                                        void    *user_data);
+
+/*
  * Invoked when Servo withdraws a request that has not been answered — the page
  * navigated away, or the element left the document. Take down whatever UI is
  * showing for `request_id`; responding to it afterwards does nothing.
@@ -199,6 +239,32 @@ void servo_webview_file_picker_respond(ServoWebViewHandle *webview,
                                        uint64_t            request_id,
                                        const char *const  *paths,
                                        size_t              path_count);
+
+void servo_webview_set_authentication_callback(ServoWebViewHandle         *webview,
+                                               ServoAuthenticationCallback callback,
+                                               void                       *user_data);
+void servo_webview_set_permission_callback(ServoWebViewHandle     *webview,
+                                           ServoPermissionCallback callback,
+                                           void                   *user_data);
+
+/*
+ * Answer an authentication challenge reported through a
+ * ServoAuthenticationCallback. Supply both `username` and `password` to
+ * authenticate; a NULL for either declines to supply credentials and the load
+ * fails as unauthenticated. An unknown `request_id` is ignored.
+ */
+void servo_webview_authentication_respond(ServoWebViewHandle *webview,
+                                          uint64_t            request_id,
+                                          const char         *username,
+                                          const char         *password);
+
+/*
+ * Answer a permission request reported through a ServoPermissionCallback. A
+ * request that is never answered is denied. An unknown `request_id` is ignored.
+ */
+void servo_webview_permission_respond(ServoWebViewHandle *webview,
+                                      uint64_t            request_id,
+                                      bool                allowed);
 
 /* Navigation. */
 void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);

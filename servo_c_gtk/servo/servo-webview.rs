@@ -31,10 +31,11 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    EmbedderControl, EmbedderControlId, FilePicker, Key, KeyState, KeyboardEvent, LoadStatus,
-    Location,
+    AuthenticationRequest, EmbedderControl, EmbedderControlId, FilePicker, Key, KeyState,
+    KeyboardEvent, LoadStatus, Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
-    PrefValue, Preferences, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
+    PermissionFeature, PermissionRequest, PrefValue, Preferences, RenderingContext, Scroll,
+    Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
     WebViewVector,
 };
@@ -108,6 +109,67 @@ pub type ServoFilePickerCallback = extern "C" fn(
     user_data: *mut c_void,
 );
 
+/// Called when a server or proxy asks for HTTP authentication.
+///
+/// The request is *not* answered when this returns: the host prompts for
+/// credentials and later calls [`servo_webview_authentication_respond`] with
+/// `request_id`. `url` is the URL that triggered the challenge, valid only for
+/// the duration of the call. `for_proxy` distinguishes a proxy challenge from
+/// an origin one — the two must not be confused, since credentials for one are
+/// not credentials for the other.
+pub type ServoAuthenticationCallback = extern "C" fn(
+    request_id: u64,
+    url: *const c_char,
+    for_proxy: bool,
+    user_data: *mut c_void,
+);
+
+/// Called when a page asks for a permission-gated capability.
+///
+/// The request is *not* answered when this returns; call
+/// [`servo_webview_permission_respond`] with `request_id`. `feature` is a
+/// `servo_permission` value. Never answering denies the request, which is also
+/// what happens with no callback registered.
+pub type ServoPermissionCallback =
+    extern "C" fn(request_id: u64, feature: u32, user_data: *mut c_void);
+
+/// Permission-gated capabilities. Mirrors the `SERVO_PERMISSION_*` constants in
+/// `servo-webview.h` — keep the two in sync.
+mod servo_permission {
+    pub const GEOLOCATION: u32 = 0;
+    pub const NOTIFICATIONS: u32 = 1;
+    pub const PUSH: u32 = 2;
+    pub const MIDI: u32 = 3;
+    pub const CAMERA: u32 = 4;
+    pub const MICROPHONE: u32 = 5;
+    pub const SPEAKER: u32 = 6;
+    pub const DEVICE_INFO: u32 = 7;
+    pub const BACKGROUND_SYNC: u32 = 8;
+    pub const BLUETOOTH: u32 = 9;
+    pub const PERSISTENT_STORAGE: u32 = 10;
+    pub const SCREEN_WAKE_LOCK: u32 = 11;
+}
+
+/// Map a Servo [`PermissionFeature`] to its `servo_permission` ABI value. The
+/// match is exhaustive on purpose: a feature added to a later Servo breaks this
+/// build rather than silently arriving at the host as something else.
+fn permission_feature_to_abi(feature: PermissionFeature) -> u32 {
+    match feature {
+        PermissionFeature::Geolocation => servo_permission::GEOLOCATION,
+        PermissionFeature::Notifications => servo_permission::NOTIFICATIONS,
+        PermissionFeature::Push => servo_permission::PUSH,
+        PermissionFeature::Midi => servo_permission::MIDI,
+        PermissionFeature::Camera => servo_permission::CAMERA,
+        PermissionFeature::Microphone => servo_permission::MICROPHONE,
+        PermissionFeature::Speaker => servo_permission::SPEAKER,
+        PermissionFeature::DeviceInfo => servo_permission::DEVICE_INFO,
+        PermissionFeature::BackgroundSync => servo_permission::BACKGROUND_SYNC,
+        PermissionFeature::Bluetooth => servo_permission::BLUETOOTH,
+        PermissionFeature::PersistentStorage => servo_permission::PERSISTENT_STORAGE,
+        PermissionFeature::ScreenWakeLock => servo_permission::SCREEN_WAKE_LOCK,
+    }
+}
+
 /// Called when Servo withdraws a request the host has not answered yet — the
 /// page navigated away, or the element went out of the document. The host
 /// should take down whatever UI it put up for `request_id`; responding to it
@@ -132,12 +194,16 @@ mod servo_dialog {
 enum PendingRequest {
     SimpleDialog(SimpleDialog),
     FilePicker(FilePicker),
+    Authentication(AuthenticationRequest),
+    Permission(PermissionRequest),
 }
 
 /// A [`PendingRequest`] plus the engine-side id it arrived with, which is what
-/// `hide_embedder_control` names when Servo withdraws it.
+/// `hide_embedder_control` names when Servo withdraws it. Requests that do not
+/// come from `show_embedder_control` — authentication and permission prompts —
+/// cannot be withdrawn and carry `None`.
 struct Pending {
-    control_id: EmbedderControlId,
+    control_id: Option<EmbedderControlId>,
     request: PendingRequest,
 }
 
@@ -156,7 +222,7 @@ struct RequestRegistry {
 
 impl RequestRegistry {
     /// Store `request` and return the id C should use to answer it.
-    fn insert(&self, control_id: EmbedderControlId, request: PendingRequest) -> u64 {
+    fn insert(&self, control_id: Option<EmbedderControlId>, request: PendingRequest) -> u64 {
         let id = self.next_id.get().wrapping_add(1);
         self.next_id.set(id);
         self.requests.borrow_mut().insert(
@@ -184,7 +250,7 @@ impl RequestRegistry {
         let mut requests = self.requests.borrow_mut();
         let id = requests
             .iter()
-            .find(|(_, pending)| pending.control_id == control_id)
+            .find(|(_, pending)| pending.control_id == Some(control_id))
             .map(|(id, _)| *id)?;
         requests.remove(&id);
         Some(id)
@@ -236,6 +302,16 @@ struct FilePickerCallback {
     user_data: *mut c_void,
 }
 
+struct AuthenticationCallback {
+    func: ServoAuthenticationCallback,
+    user_data: *mut c_void,
+}
+
+struct PermissionCallback {
+    func: ServoPermissionCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -248,6 +324,8 @@ struct EmbedderDelegate {
     history_callback: RefCell<Option<HistoryCallback>>,
     dialog_callback: RefCell<Option<DialogCallback>>,
     file_picker_callback: RefCell<Option<FilePickerCallback>>,
+    authentication_callback: RefCell<Option<AuthenticationCallback>>,
+    permission_callback: RefCell<Option<PermissionCallback>>,
     request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
     requests: RequestRegistry,
 }
@@ -264,6 +342,8 @@ impl EmbedderDelegate {
             history_callback: RefCell::new(None),
             dialog_callback: RefCell::new(None),
             file_picker_callback: RefCell::new(None),
+            authentication_callback: RefCell::new(None),
+            permission_callback: RefCell::new(None),
             request_cancelled_callback: RefCell::new(None),
             requests: RequestRegistry::default(),
         }
@@ -372,6 +452,56 @@ impl WebViewDelegate for EmbedderDelegate {
         }
     }
 
+    fn request_authentication(
+        &self,
+        _webview: WebView,
+        authentication_request: AuthenticationRequest,
+    ) {
+        let cb = self
+            .authentication_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        // With no callback the request is dropped, which answers it with no
+        // credentials — the load then fails as unauthenticated rather than
+        // proceeding, which is the fail-closed outcome.
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        let Ok(url) = CString::new(authentication_request.url().as_str()) else {
+            return;
+        };
+        let for_proxy = authentication_request.for_proxy();
+
+        let id = self.requests.insert(
+            None,
+            PendingRequest::Authentication(authentication_request),
+        );
+
+        func(id, url.as_ptr(), for_proxy, user_data);
+    }
+
+    fn request_permission(&self, _webview: WebView, permission_request: PermissionRequest) {
+        let cb = self
+            .permission_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        // With no callback the request is dropped, which denies it: Servo
+        // builds these with AllowOrDeny::Deny as the default response.
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        let feature = permission_feature_to_abi(permission_request.feature());
+        let id = self
+            .requests
+            .insert(None, PendingRequest::Permission(permission_request));
+
+        func(id, feature, user_data);
+    }
+
     fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
         // Dropping the stored request answers it with its conservative default.
         let Some(id) = self.requests.take_by_control_id(control_id) else {
@@ -422,7 +552,7 @@ impl EmbedderDelegate {
 
         let id = self
             .requests
-            .insert(control_id, PendingRequest::SimpleDialog(dialog));
+            .insert(Some(control_id), PendingRequest::SimpleDialog(dialog));
 
         func(
             id,
@@ -461,7 +591,7 @@ impl EmbedderDelegate {
 
         let id = self
             .requests
-            .insert(control_id, PendingRequest::FilePicker(picker));
+            .insert(Some(control_id), PendingRequest::FilePicker(picker));
 
         func(
             id,
@@ -880,6 +1010,121 @@ pub unsafe extern "C" fn servo_webview_set_file_picker_callback(
     };
     *handle.delegate.file_picker_callback.borrow_mut() =
         callback.map(|func| FilePickerCallback { func, user_data });
+}
+
+/// Register the authentication callback, invoked when a server or proxy issues
+/// an HTTP authentication challenge. Pass a NULL `callback` to clear it.
+///
+/// With no callback registered the challenge is answered with no credentials,
+/// so the load fails as unauthenticated rather than proceeding.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_authentication_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoAuthenticationCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.authentication_callback.borrow_mut() =
+        callback.map(|func| AuthenticationCallback { func, user_data });
+}
+
+/// Register the permission callback, invoked when a page asks for a
+/// permission-gated capability. Pass a NULL `callback` to clear it.
+///
+/// With no callback registered the request is denied.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_permission_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoPermissionCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.permission_callback.borrow_mut() =
+        callback.map(|func| PermissionCallback { func, user_data });
+}
+
+/// Answer an authentication challenge reported through a
+/// [`ServoAuthenticationCallback`].
+///
+/// Supply both `username` and `password` to authenticate. A NULL `username` or
+/// `password` declines to supply credentials, and the load fails as
+/// unauthenticated. Credentials that are not valid UTF-8 are treated the same
+/// way rather than being sent mangled.
+///
+/// An unknown `request_id` is ignored.
+///
+/// # Safety
+/// `webview` must be a valid handle; `username` and `password` must each be
+/// NULL or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_authentication_respond(
+    webview: *mut ServoWebViewHandle,
+    request_id: u64,
+    username: *const c_char,
+    password: *const c_char,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    let Some(PendingRequest::Authentication(request)) =
+        handle.delegate.requests.take(request_id)
+    else {
+        return;
+    };
+
+    if username.is_null() || password.is_null() {
+        // Dropping answers with no credentials.
+        return;
+    }
+
+    let (Ok(username), Ok(password)) = (
+        unsafe { CStr::from_ptr(username) }.to_str(),
+        unsafe { CStr::from_ptr(password) }.to_str(),
+    ) else {
+        return;
+    };
+
+    request.authenticate(username.to_owned(), password.to_owned());
+}
+
+/// Answer a permission request reported through a [`ServoPermissionCallback`].
+///
+/// An unknown `request_id` is ignored. A request that is never answered is
+/// denied when the handle is dropped.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_permission_respond(
+    webview: *mut ServoWebViewHandle,
+    request_id: u64,
+    allowed: bool,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    let Some(PendingRequest::Permission(request)) = handle.delegate.requests.take(request_id)
+    else {
+        return;
+    };
+
+    if allowed {
+        request.allow();
+    } else {
+        request.deny();
+    }
 }
 
 /// Answer a file picker previously reported through a

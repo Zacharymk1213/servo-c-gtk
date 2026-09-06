@@ -23,6 +23,8 @@ enum {
     SCRIPT_DIALOG,
     SCRIPT_DIALOG_CANCELLED,
     RUN_FILE_CHOOSER,
+    AUTHENTICATE,
+    PERMISSION_REQUEST,
     N_SIGNALS
 };
 
@@ -94,6 +96,41 @@ servo_gtk_script_dialog_type_get_type(void)
             { 0, NULL, NULL }
         };
         GType id = g_enum_register_static("ServoGtkScriptDialogType", values);
+        g_once_init_leave(&type_id, id);
+    }
+
+    return (GType) type_id;
+}
+
+/*
+ * Register ServoGtkPermissionFeature as a GType so the ::permission-request
+ * signal carries a proper enumeration rather than a bare integer.
+ */
+GType
+servo_gtk_permission_feature_get_type(void)
+{
+    static gsize type_id = 0;
+
+    if (g_once_init_enter(&type_id)) {
+        static const GEnumValue values[] = {
+#define SERVO_GTK_PERMISSION_VALUE(name, nick) \
+            { SERVO_GTK_PERMISSION_##name, "SERVO_GTK_PERMISSION_" #name, nick }
+            SERVO_GTK_PERMISSION_VALUE(GEOLOCATION,        "geolocation"),
+            SERVO_GTK_PERMISSION_VALUE(NOTIFICATIONS,      "notifications"),
+            SERVO_GTK_PERMISSION_VALUE(PUSH,               "push"),
+            SERVO_GTK_PERMISSION_VALUE(MIDI,               "midi"),
+            SERVO_GTK_PERMISSION_VALUE(CAMERA,             "camera"),
+            SERVO_GTK_PERMISSION_VALUE(MICROPHONE,         "microphone"),
+            SERVO_GTK_PERMISSION_VALUE(SPEAKER,            "speaker"),
+            SERVO_GTK_PERMISSION_VALUE(DEVICE_INFO,        "device-info"),
+            SERVO_GTK_PERMISSION_VALUE(BACKGROUND_SYNC,    "background-sync"),
+            SERVO_GTK_PERMISSION_VALUE(BLUETOOTH,          "bluetooth"),
+            SERVO_GTK_PERMISSION_VALUE(PERSISTENT_STORAGE, "persistent-storage"),
+            SERVO_GTK_PERMISSION_VALUE(SCREEN_WAKE_LOCK,   "screen-wake-lock"),
+#undef SERVO_GTK_PERMISSION_VALUE
+            { 0, NULL, NULL }
+        };
+        GType id = g_enum_register_static("ServoGtkPermissionFeature", values);
         g_once_init_leave(&type_id, id);
     }
 
@@ -607,6 +644,210 @@ servo_gtk_web_view_on_file_picker(guint64            request_id,
     g_ptr_array_free(patterns, TRUE);
 }
 
+/* ------------------------------------------------------------------ *
+ * Built-in credentials prompt
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    ServoGtkWebView *web_view;    /* holds a reference */
+    GtkWidget       *username;    /* unowned */
+    GtkWidget       *password;    /* unowned */
+    guint64          request_id;
+    gboolean         responded;
+} AuthClosure;
+
+static void
+auth_closure_free(gpointer data)
+{
+    AuthClosure *closure = data;
+
+    g_object_unref(closure->web_view);
+    g_free(closure);
+}
+
+/*
+ * Answer the challenge this dialog is showing, at most once. Cancelling sends
+ * NULL credentials, which fails the load as unauthenticated rather than
+ * retrying it unauthenticated behind the user's back.
+ */
+static void
+auth_respond(GtkWidget *dialog, gboolean accepted)
+{
+    AuthClosure *closure = g_object_get_data(G_OBJECT(dialog), "servo-gtk-auth");
+
+    if (closure == NULL || closure->responded) {
+        return;
+    }
+    closure->responded = TRUE;
+
+    if (accepted) {
+        servo_gtk_web_view_respond_to_authentication(
+            closure->web_view, closure->request_id,
+            gtk_entry_get_text(GTK_ENTRY(closure->username)),
+            gtk_entry_get_text(GTK_ENTRY(closure->password)));
+    } else {
+        servo_gtk_web_view_respond_to_authentication(
+            closure->web_view, closure->request_id, NULL, NULL);
+    }
+}
+
+static void
+on_auth_destroy(GtkWidget *dialog, gpointer user_data)
+{
+    (void) user_data;
+
+    auth_respond(dialog, FALSE);
+}
+
+static void
+on_auth_response(GtkDialog *dialog, gint response_id, gpointer user_data)
+{
+    (void) user_data;
+
+    auth_respond(GTK_WIDGET(dialog), response_id == GTK_RESPONSE_OK);
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+/* Class closure for ::authenticate: prompt for credentials ourselves. */
+static gboolean
+servo_gtk_web_view_default_authenticate(ServoGtkWebView *self,
+                                        const gchar     *uri,
+                                        gboolean         for_proxy,
+                                        guint64          request_id)
+{
+    AuthClosure *closure;
+    GtkWidget   *dialog;
+    GtkWidget   *content;
+    GtkWidget   *label;
+    GtkWidget   *toplevel;
+    gchar       *text;
+    guint64     *key;
+
+    dialog = gtk_dialog_new();
+    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+    gtk_window_set_title(GTK_WINDOW(dialog), "Authentication Required");
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(self));
+    if (toplevel != NULL && gtk_widget_is_toplevel(toplevel)) {
+        gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(toplevel));
+    }
+
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "_Cancel", GTK_RESPONSE_CANCEL);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "_Authenticate", GTK_RESPONSE_OK);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_box_set_spacing(GTK_BOX(content), 12);
+    gtk_widget_set_margin_start(content, 18);
+    gtk_widget_set_margin_end(content, 18);
+    gtk_widget_set_margin_top(content, 18);
+    gtk_widget_set_margin_bottom(content, 18);
+
+    /*
+     * Say plainly which side is asking: credentials meant for an origin must
+     * not be handed to a proxy, or the other way round.
+     */
+    text = g_strdup_printf(for_proxy
+                               ? "The proxy for %s requires a username and password."
+                               : "%s requires a username and password.",
+                           uri != NULL ? uri : "this site");
+    label = gtk_label_new(text);
+    g_free(text);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 50);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 0);
+
+    closure = g_new0(AuthClosure, 1);
+    closure->web_view = g_object_ref(self);
+    closure->request_id = request_id;
+
+    closure->username = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(closure->username), "Username");
+    gtk_entry_set_activates_default(GTK_ENTRY(closure->username), TRUE);
+    gtk_box_pack_start(GTK_BOX(content), closure->username, FALSE, FALSE, 0);
+
+    closure->password = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(closure->password), "Password");
+    gtk_entry_set_visibility(GTK_ENTRY(closure->password), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(closure->password), GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_activates_default(GTK_ENTRY(closure->password), TRUE);
+    gtk_box_pack_start(GTK_BOX(content), closure->password, FALSE, FALSE, 0);
+
+    g_object_set_data_full(G_OBJECT(dialog), "servo-gtk-auth",
+                           closure, auth_closure_free);
+
+    g_signal_connect(dialog, "response", G_CALLBACK(on_auth_response), NULL);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(on_auth_destroy), NULL);
+
+    /* Share the dialog table so widget disposal takes this window down too. */
+    key = g_new(guint64, 1);
+    *key = request_id;
+    g_hash_table_insert(self->priv->dialogs, key, dialog);
+
+    gtk_widget_show_all(dialog);
+    gtk_widget_grab_focus(closure->username);
+
+    return TRUE;
+}
+
+/*
+ * A server or proxy asked for credentials. Only reports the challenge; the
+ * credentials travel back later through
+ * servo_gtk_web_view_respond_to_authentication().
+ */
+static void
+servo_gtk_web_view_on_authentication(guint64     request_id,
+                                     const char *url,
+                                     bool        for_proxy,
+                                     gpointer    user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gboolean         handled = FALSE;
+
+    g_signal_emit(self, signals[AUTHENTICATE], 0,
+                  url, (gboolean) for_proxy, request_id, &handled);
+}
+
+/*
+ * A page asked for a permission-gated capability. Unanswered requests are
+ * denied, so an unknown feature is refused rather than guessed at.
+ */
+static void
+servo_gtk_web_view_on_permission(guint64  request_id,
+                                 guint32  feature,
+                                 gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gboolean         handled = FALSE;
+
+    if (feature > SERVO_GTK_PERMISSION_SCREEN_WAKE_LOCK) {
+        servo_gtk_web_view_respond_to_permission_request(self, request_id, FALSE);
+        return;
+    }
+
+    g_signal_emit(self, signals[PERMISSION_REQUEST], 0,
+                  (ServoGtkPermissionFeature) feature, request_id, &handled);
+}
+
+/*
+ * Class closure for ::permission-request. Nothing here can know whether the
+ * user wants to grant a capability, so it refuses: an application that wants to
+ * prompt connects to the signal and answers there.
+ */
+static gboolean
+servo_gtk_web_view_default_permission_request(ServoGtkWebView           *self,
+                                              ServoGtkPermissionFeature  feature,
+                                              guint64                    request_id)
+{
+    (void) feature;
+
+    servo_gtk_web_view_respond_to_permission_request(self, request_id, FALSE);
+
+    return TRUE;
+}
+
 /* Pump Servo's event loop once per frame clock tick. */
 static gboolean
 servo_gtk_web_view_tick(GtkWidget     *widget,
@@ -815,6 +1056,10 @@ servo_gtk_web_view_sync_surface(ServoGtkWebView *self, int width, int height)
                 self->servo, servo_gtk_web_view_on_dialog, self);
             servo_webview_set_file_picker_callback(
                 self->servo, servo_gtk_web_view_on_file_picker, self);
+            servo_webview_set_authentication_callback(
+                self->servo, servo_gtk_web_view_on_authentication, self);
+            servo_webview_set_permission_callback(
+                self->servo, servo_gtk_web_view_on_permission, self);
             servo_webview_set_request_cancelled_callback(
                 self->servo, servo_gtk_web_view_on_request_cancelled, self);
         }
@@ -1079,6 +1324,8 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
 
     klass->script_dialog = servo_gtk_web_view_default_script_dialog;
     klass->run_file_chooser = servo_gtk_web_view_default_run_file_chooser;
+    klass->authenticate = servo_gtk_web_view_default_authenticate;
+    klass->permission_request = servo_gtk_web_view_default_permission_request;
 
     widget_class->draw = servo_gtk_web_view_draw;
     widget_class->size_allocate = servo_gtk_web_view_size_allocate;
@@ -1281,6 +1528,68 @@ servo_gtk_web_view_class_init(ServoGtkWebViewClass *klass)
             G_TYPE_BOOLEAN,
             G_TYPE_UINT64
         );
+
+    /**
+     * ServoGtkWebView::authenticate:
+     * @self: the #ServoGtkWebView
+     * @uri: the URI that triggered the challenge
+     * @for_proxy: %TRUE for a proxy challenge, %FALSE for an origin one
+     * @request_id: identifies this challenge when answering it
+     *
+     * Emitted when a server or proxy issues an HTTP authentication challenge.
+     * The default handler prompts for a username and password and answers.
+     *
+     * Return %TRUE from a handler to prompt yourself; you must then call
+     * servo_gtk_web_view_respond_to_authentication() with @request_id. Do not
+     * offer credentials stored for an origin in answer to a proxy challenge, or
+     * the other way round: @for_proxy distinguishes the two.
+     *
+     * Returns: %TRUE to stop the built-in prompt from being shown
+     */
+    signals[AUTHENTICATE] =
+        g_signal_new(
+            "authenticate",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, authenticate),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            3,
+            G_TYPE_STRING,
+            G_TYPE_BOOLEAN,
+            G_TYPE_UINT64
+        );
+
+    /**
+     * ServoGtkWebView::permission-request:
+     * @self: the #ServoGtkWebView
+     * @feature: the capability the page asked for
+     * @request_id: identifies this request when answering it
+     *
+     * Emitted when a page asks for a permission-gated capability such as
+     * geolocation or the camera.
+     *
+     * The default handler refuses, since nothing at this level can know what
+     * the user wants. Connect to the signal, return %TRUE, and answer with
+     * servo_gtk_web_view_respond_to_permission_request() to prompt instead. A
+     * request that is never answered is denied.
+     *
+     * Returns: %TRUE to stop the default refusal
+     */
+    signals[PERMISSION_REQUEST] =
+        g_signal_new(
+            "permission-request",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            G_STRUCT_OFFSET(ServoGtkWebViewClass, permission_request),
+            g_signal_accumulator_true_handled, NULL,
+            NULL,       /* default (generic) C marshaller */
+            G_TYPE_BOOLEAN,
+            2,
+            SERVO_GTK_TYPE_PERMISSION_FEATURE,
+            G_TYPE_UINT64
+        );
 }
 
 static void
@@ -1442,6 +1751,33 @@ servo_gtk_web_view_respond_to_file_chooser(ServoGtkWebView    *self,
     }
 
     servo_webview_file_picker_respond(self->servo, request_id, paths, count);
+}
+
+void
+servo_gtk_web_view_respond_to_authentication(ServoGtkWebView *self,
+                                             guint64          request_id,
+                                             const gchar     *username,
+                                             const gchar     *password)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    g_hash_table_remove(self->priv->dialogs, &request_id);
+
+    if (self->servo != NULL) {
+        servo_webview_authentication_respond(self->servo, request_id, username, password);
+    }
+}
+
+void
+servo_gtk_web_view_respond_to_permission_request(ServoGtkWebView *self,
+                                                 guint64          request_id,
+                                                 gboolean         allowed)
+{
+    g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
+
+    if (self->servo != NULL) {
+        servo_webview_permission_respond(self->servo, request_id, allowed);
+    }
 }
 
 /*
