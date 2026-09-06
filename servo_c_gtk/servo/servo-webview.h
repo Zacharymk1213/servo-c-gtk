@@ -180,6 +180,29 @@ typedef void (*ServoCreateWebViewCallback)(uint64_t request_id,
 typedef void (*ServoClosedCallback)(void *user_data);
 
 /*
+ * Invoked when the page focuses an editable field and an input method should be
+ * shown. `text` is the field's current contents and `insertion_point` the
+ * zero-based cursor position within it, or -1 when the cursor is not in the
+ * field. `x`, `y`, `width` and `height` are the field's area in device pixels,
+ * for placing the input method's own window. `text` is valid only for the
+ * duration of the call.
+ */
+typedef void (*ServoInputMethodCallback)(bool        multiline,
+                                         const char *text,
+                                         int32_t     insertion_point,
+                                         int32_t     x,
+                                         int32_t     y,
+                                         int32_t     width,
+                                         int32_t     height,
+                                         void       *user_data);
+
+/*
+ * Invoked when the input method should be hidden again — the page moved focus
+ * out of the editable field.
+ */
+typedef void (*ServoInputMethodHiddenCallback)(void *user_data);
+
+/*
  * Invoked when a server or proxy issues an HTTP authentication challenge. The
  * request is NOT answered when this returns: prompt for credentials and call
  * servo_webview_authentication_respond() with `request_id`.
@@ -348,6 +371,13 @@ void servo_webview_set_create_webview_callback(ServoWebViewHandle        *webvie
 void servo_webview_set_closed_callback(ServoWebViewHandle *webview,
                                        ServoClosedCallback callback,
                                        void               *user_data);
+void servo_webview_set_input_method_callback(ServoWebViewHandle      *webview,
+                                             ServoInputMethodCallback callback,
+                                             void                    *user_data);
+void servo_webview_set_input_method_hidden_callback(
+    ServoWebViewHandle            *webview,
+    ServoInputMethodHiddenCallback callback,
+    void                          *user_data);
 
 /*
  * Accept a popup request reported through a ServoCreateWebViewCallback and build
@@ -408,6 +438,26 @@ void servo_webview_pointer_button(ServoWebViewHandle *webview,
                                   double              x,
                                   double              y);
 void servo_webview_scroll(ServoWebViewHandle *webview, double dx, double dy);
+
+/* The stage a composition is at. */
+typedef enum {
+    SERVO_COMPOSITION_START = 0,
+    SERVO_COMPOSITION_UPDATE = 1,
+    SERVO_COMPOSITION_END = 2
+} ServoCompositionState;
+
+/*
+ * Report a composition event from the host's input method. START opens a
+ * composition, UPDATE replaces its in-progress text, and END commits `text` (or
+ * clears the composition when `text` is empty or NULL). An unrecognised state
+ * ends the composition rather than leaving preedit text nothing can clear.
+ */
+void servo_webview_composition(ServoWebViewHandle *webview,
+                               uint32_t            state,
+                               const char         *text);
+
+/* Report that the input method was dismissed without committing. */
+void servo_webview_ime_dismissed(ServoWebViewHandle *webview);
 
 /* The stage a touch point is at. */
 typedef enum {

@@ -248,6 +248,30 @@ servo_webview_pointer_button(ServoWebViewHandle *webview,
 }
 
 void
+servo_webview_set_input_method_callback(ServoWebViewHandle      *webview,
+                                        ServoInputMethodCallback callback,
+                                        void                    *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_set_input_method_hidden_callback(ServoWebViewHandle            *webview,
+                                               ServoInputMethodHiddenCallback callback,
+                                               void                          *user_data)
+{
+    (void) webview; (void) callback; (void) user_data;
+}
+
+void
+servo_webview_composition(ServoWebViewHandle *webview, uint32_t state, const char *text)
+{
+    (void) webview; (void) state; (void) text;
+}
+
+void servo_webview_ime_dismissed(ServoWebViewHandle *webview) { (void) webview; }
+
+void
 servo_webview_touch(ServoWebViewHandle *webview,
                     uint32_t            phase,
                     int32_t             touch_id,

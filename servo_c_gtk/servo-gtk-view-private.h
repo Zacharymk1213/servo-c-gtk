@@ -40,12 +40,15 @@ G_BEGIN_DECLS
 #  define SERVO_GTK_WIDGET_HEIGHT(widget) gtk_widget_get_allocated_height(widget)
 #  define SERVO_GTK_DESTROY_WINDOW(w)     gtk_widget_destroy(w)
 #  define SERVO_GTK_ENTRY_TEXT(entry)     gtk_entry_get_text(GTK_ENTRY(entry))
+#  define SERVO_GTK_IM_SET_CLIENT(im, widget) \
+    gtk_im_context_set_client_window(im, gtk_widget_get_window(widget))
 #else
 #  define SERVO_GTK_ALT_MASK              GDK_ALT_MASK
 #  define SERVO_GTK_WIDGET_WIDTH(widget)  gtk_widget_get_width(widget)
 #  define SERVO_GTK_WIDGET_HEIGHT(widget) gtk_widget_get_height(widget)
 #  define SERVO_GTK_DESTROY_WINDOW(w)     gtk_window_destroy(GTK_WINDOW(w))
 #  define SERVO_GTK_ENTRY_TEXT(entry)     gtk_editable_get_text(GTK_EDITABLE(entry))
+#  define SERVO_GTK_IM_SET_CLIENT(im, widget) gtk_im_context_set_client_widget(im, widget)
 #endif
 
 /* ------------------------------------------------------------------ *
@@ -89,6 +92,17 @@ struct _ServoGtkWebViewPrivate {
      */
     GHashTable *touch_sequences;
     gint        next_touch_id;
+    /*
+     * The input method the widget feeds keys through, so dead keys, compose
+     * sequences and CJK conversion work. Owned by the widget.
+     */
+    GtkIMContext *im_context;
+    /*
+     * Whether a composition is open. Only a commit that arrives during one is
+     * forwarded as text: outside a composition the key event already carries
+     * the character, and sending both would insert it twice.
+     */
+    gboolean      composing;
 };
 
 /* ------------------------------------------------------------------ *
@@ -150,6 +164,12 @@ G_GNUC_INTERNAL double servo_gtk_web_view_to_device(ServoGtkWebView *self,
  * Forward one touch point to Servo, resolving @sequence to a touch id that is
  * stable for the gesture. Coordinates are in widget (logical) units.
  */
+/*
+ * Create the input method and connect its signals. Called from the toolkit half
+ * of init, which is also where the key path that feeds it is set up.
+ */
+G_GNUC_INTERNAL void servo_gtk_web_view_init_input_method(ServoGtkWebView *self);
+
 G_GNUC_INTERNAL void servo_gtk_web_view_touch(ServoGtkWebView   *self,
                                               ServoTouchPhase    phase,
                                               GdkEventSequence  *sequence,

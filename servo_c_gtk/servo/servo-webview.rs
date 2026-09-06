@@ -31,9 +31,9 @@ use std::sync::Once;
 use euclid::{Point2D, Scale};
 use servo::{
     Code, Cursor, DeviceIntRect, DeviceVector2D, InputEvent, JSValue, JavaScriptEvaluationError,
-    AuthenticationRequest, ContextMenu, ContextMenuAction, ContextMenuItem,
-    CreateNewWebViewRequest, EmbedderControl, EmbedderControlId, FilePicker, Key, KeyState,
-    KeyboardEvent, LoadStatus, Location,
+    AuthenticationRequest, CompositionEvent, CompositionState, ContextMenu, ContextMenuAction,
+    ContextMenuItem, CreateNewWebViewRequest, EmbedderControl, EmbedderControlId, FilePicker,
+    ImeEvent, InputMethodControl, Key, KeyState, KeyboardEvent, LoadStatus, Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
     PermissionFeature, PermissionRequest, PrefValue, Preferences, RenderingContext, Scroll,
     Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType, TouchId,
@@ -191,6 +191,49 @@ pub type ServoCreateWebViewCallback =
 /// opened a popup closing it. The host should take down whatever window is
 /// showing this webview and free its handle.
 pub type ServoClosedCallback = extern "C" fn(user_data: *mut c_void);
+
+/// Called when the page focuses an editable field and an input method should be
+/// shown.
+///
+/// `text` is the field's current contents and `insertion_point` the zero-based
+/// cursor position within it, or -1 when the cursor is not in the field. `x`,
+/// `y`, `width` and `height` are the field's area in device pixels, for placing
+/// the input method's own window. `text` is valid only for the duration of the
+/// call.
+pub type ServoInputMethodCallback = extern "C" fn(
+    multiline: bool,
+    text: *const c_char,
+    insertion_point: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    user_data: *mut c_void,
+);
+
+/// Called when the input method should be hidden again — the page moved focus
+/// out of the editable field.
+pub type ServoInputMethodHiddenCallback = extern "C" fn(user_data: *mut c_void);
+
+/// Composition states understood by [`servo_webview_composition`]. Mirrors the
+/// `SERVO_COMPOSITION_*` constants in `servo-webview.h` — keep the two in sync.
+mod servo_composition {
+    pub const START: u32 = 0;
+    pub const UPDATE: u32 = 1;
+    pub const END: u32 = 2;
+}
+
+/// Map a `ServoCompositionState` value to Servo's [`CompositionState`].
+///
+/// An unrecognised state ends the composition: leaving one open would keep the
+/// field showing preedit text that nothing could clear.
+fn composition_state_from_abi(state: u32) -> CompositionState {
+    match state {
+        servo_composition::START => CompositionState::Start,
+        servo_composition::UPDATE => CompositionState::Update,
+        _ => CompositionState::End,
+    }
+}
 
 /// Called when a server or proxy asks for HTTP authentication.
 ///
@@ -426,6 +469,16 @@ struct ClosedCallback {
     user_data: *mut c_void,
 }
 
+struct InputMethodCallback {
+    func: ServoInputMethodCallback,
+    user_data: *mut c_void,
+}
+
+struct InputMethodHiddenCallback {
+    func: ServoInputMethodHiddenCallback,
+    user_data: *mut c_void,
+}
+
 /// Servo delegate that turns presented frames, cursor changes and URL changes
 /// into calls into the registered C callbacks.
 struct EmbedderDelegate {
@@ -443,6 +496,12 @@ struct EmbedderDelegate {
     context_menu_callback: RefCell<Option<ContextMenuCallback>>,
     create_webview_callback: RefCell<Option<CreateWebViewCallback>>,
     closed_callback: RefCell<Option<ClosedCallback>>,
+    input_method_callback: RefCell<Option<InputMethodCallback>>,
+    input_method_hidden_callback: RefCell<Option<InputMethodHiddenCallback>>,
+    /// The input-method control currently showing, so the withdrawal that hides
+    /// it again can be recognised. Input methods are not answered like the other
+    /// controls, so they are not in the request registry.
+    input_method_control_id: Cell<Option<EmbedderControlId>>,
     request_cancelled_callback: RefCell<Option<RequestCancelledCallback>>,
     requests: RequestRegistry<EmbedderControlId, PendingRequest>,
 }
@@ -464,6 +523,9 @@ impl EmbedderDelegate {
             context_menu_callback: RefCell::new(None),
             create_webview_callback: RefCell::new(None),
             closed_callback: RefCell::new(None),
+            input_method_callback: RefCell::new(None),
+            input_method_hidden_callback: RefCell::new(None),
+            input_method_control_id: Cell::new(None),
             request_cancelled_callback: RefCell::new(None),
             requests: RequestRegistry::default(),
         }
@@ -566,9 +628,10 @@ impl WebViewDelegate for EmbedderDelegate {
             EmbedderControl::SimpleDialog(dialog) => self.show_simple_dialog(control_id, dialog),
             EmbedderControl::FilePicker(picker) => self.show_file_picker(control_id, picker),
             EmbedderControl::ContextMenu(menu) => self.show_context_menu(control_id, menu),
-            // Select-element pickers, colour pickers and IME are not wired up
-            // yet. Dropping the control answers it with its default (dismissed
-            // / no selection) rather than leaving script waiting.
+            EmbedderControl::InputMethod(control) => self.show_input_method(control_id, control),
+            // Select-element pickers and colour pickers are not wired up yet.
+            // Dropping the control answers it with its default (dismissed / no
+            // selection) rather than leaving script waiting.
             _ => {},
         }
     }
@@ -658,6 +721,22 @@ impl WebViewDelegate for EmbedderDelegate {
     }
 
     fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
+        // An input method is not a request that gets answered; withdrawing it
+        // just means the field lost focus and the IME should go away.
+        if self.input_method_control_id.get() == Some(control_id) {
+            self.input_method_control_id.set(None);
+
+            let cb = self
+                .input_method_hidden_callback
+                .borrow()
+                .as_ref()
+                .map(|c| (c.func, c.user_data));
+            if let Some((func, user_data)) = cb {
+                func(user_data);
+            }
+            return;
+        }
+
         // Dropping the stored request answers it with its conservative default.
         let Some(id) = self.requests.take_by_control_id(control_id) else {
             return;
@@ -812,6 +891,37 @@ impl EmbedderDelegate {
             .insert(Some(control_id), PendingRequest::ContextMenu(menu));
 
         func(id, items.as_ptr(), items.len(), x, y, user_data);
+    }
+
+    /// Tell the host to show an input method for the field the page just
+    /// focused. Nothing is answered: the control is informational, and the
+    /// matching `hide_embedder_control` is what takes the IME down again.
+    fn show_input_method(&self, control_id: EmbedderControlId, control: InputMethodControl) {
+        self.input_method_control_id.set(Some(control_id));
+
+        let cb = self
+            .input_method_callback
+            .borrow()
+            .as_ref()
+            .map(|c| (c.func, c.user_data));
+        let Some((func, user_data)) = cb else {
+            return;
+        };
+
+        let text = CString::new(control.text()).unwrap_or_default();
+        let position = control.position();
+
+        func(
+            control.multiline(),
+            text.as_ptr(),
+            // -1 rather than 0 for "not in the field": 0 is a real position.
+            control.insertion_point().map_or(-1, |point| point as i32),
+            position.min.x,
+            position.min.y,
+            position.width(),
+            position.height(),
+            user_data,
+        );
     }
 }
 
@@ -1326,6 +1436,94 @@ pub unsafe extern "C" fn servo_webview_set_closed_callback(
     };
     *handle.delegate.closed_callback.borrow_mut() =
         callback.map(|func| ClosedCallback { func, user_data });
+}
+
+/// Register the input-method callback, invoked when the page focuses an
+/// editable field. Pass a NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_input_method_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoInputMethodCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.input_method_callback.borrow_mut() =
+        callback.map(|func| InputMethodCallback { func, user_data });
+}
+
+/// Register the input-method-hidden callback, invoked when focus leaves the
+/// editable field. Pass a NULL `callback` to clear it.
+///
+/// # Safety
+/// `webview` must be a valid handle. `user_data` is stored verbatim and handed
+/// back to the callback; its lifetime is the caller's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_set_input_method_hidden_callback(
+    webview: *mut ServoWebViewHandle,
+    callback: Option<ServoInputMethodHiddenCallback>,
+    user_data: *mut c_void,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+    *handle.delegate.input_method_hidden_callback.borrow_mut() =
+        callback.map(|func| InputMethodHiddenCallback { func, user_data });
+}
+
+/// Report a composition event from the host's input method.
+///
+/// `state` is a `SERVO_COMPOSITION_*` value: `START` opens a composition,
+/// `UPDATE` replaces its in-progress text, and `END` commits `text` (or clears
+/// the composition when `text` is empty or NULL). `text` that is not valid
+/// UTF-8 is treated as empty rather than passed on mangled.
+///
+/// # Safety
+/// `webview` must be a valid handle and `text` NULL or a valid NUL-terminated
+/// C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_composition(
+    webview: *mut ServoWebViewHandle,
+    state: u32,
+    text: *const c_char,
+) {
+    let Some(handle) = (unsafe { as_handle(webview) }) else {
+        return;
+    };
+
+    let data = if text.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(text) }
+            .to_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    handle
+        .webview
+        .notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+            state: composition_state_from_abi(state),
+            data,
+        })));
+}
+
+/// Report that the host's input method was dismissed without committing.
+///
+/// # Safety
+/// `webview` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_ime_dismissed(webview: *mut ServoWebViewHandle) {
+    if let Some(handle) = unsafe { as_handle(webview) } {
+        handle
+            .webview
+            .notify_input_event(InputEvent::Ime(ImeEvent::Dismissed));
+    }
 }
 
 /// Accept a popup request reported through a [`ServoCreateWebViewCallback`] and
@@ -2483,6 +2681,32 @@ mod tests {
         assert!(matches!(
             touch_event_type_from_abi(9999),
             TouchEventType::Cancel
+        ));
+    }
+
+    #[test]
+    fn composition_states_map_to_the_abi() {
+        assert!(matches!(
+            composition_state_from_abi(servo_composition::START),
+            CompositionState::Start
+        ));
+        assert!(matches!(
+            composition_state_from_abi(servo_composition::UPDATE),
+            CompositionState::Update
+        ));
+        assert!(matches!(
+            composition_state_from_abi(servo_composition::END),
+            CompositionState::End
+        ));
+    }
+
+    #[test]
+    fn an_unknown_composition_state_ends_the_composition() {
+        // Leaving one open would keep the field showing preedit text that
+        // nothing could clear.
+        assert!(matches!(
+            composition_state_from_abi(9999),
+            CompositionState::End
         ));
     }
 

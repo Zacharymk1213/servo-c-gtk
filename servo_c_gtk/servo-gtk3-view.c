@@ -513,15 +513,31 @@ servo_gtk_web_view_scroll(GtkWidget *widget, GdkEventScroll *event)
 static gboolean
 servo_gtk_web_view_key_press(GtkWidget *widget, GdkEventKey *event)
 {
-    return servo_gtk_web_view_key(
-        SERVO_GTK_WEB_VIEW(widget), event->keyval, event->state, TRUE);
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
+
+    /*
+     * Give the input method first refusal: what it consumes comes back as
+     * preedit and commit instead of as a key.
+     */
+    if (self->priv->im_context != NULL &&
+        gtk_im_context_filter_keypress(self->priv->im_context, event)) {
+        return TRUE;
+    }
+
+    return servo_gtk_web_view_key(self, event->keyval, event->state, TRUE);
 }
 
 static gboolean
 servo_gtk_web_view_key_release(GtkWidget *widget, GdkEventKey *event)
 {
-    return servo_gtk_web_view_key(
-        SERVO_GTK_WEB_VIEW(widget), event->keyval, event->state, FALSE);
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
+
+    if (self->priv->im_context != NULL &&
+        gtk_im_context_filter_keypress(self->priv->im_context, event)) {
+        return TRUE;
+    }
+
+    return servo_gtk_web_view_key(self, event->keyval, event->state, FALSE);
 }
 
 /*
@@ -549,6 +565,35 @@ servo_gtk_web_view_touch_event(GtkWidget *widget, GdkEventTouch *event)
     return FALSE;
 }
 
+/*
+ * GTK3's input method wants the widget's GdkWindow, which only exists once the
+ * widget is realized, so it is handed over here rather than in init.
+ */
+static void
+servo_gtk_web_view_realize(GtkWidget *widget)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
+
+    servo_gtk_web_view_parent_widget_class()->realize(widget);
+
+    if (self->priv->im_context != NULL) {
+        SERVO_GTK_IM_SET_CLIENT(self->priv->im_context, widget);
+    }
+}
+
+static void
+servo_gtk_web_view_unrealize(GtkWidget *widget)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(widget);
+
+    /* The window is about to go away; do not leave the input method holding it. */
+    if (self->priv->im_context != NULL) {
+        gtk_im_context_set_client_window(self->priv->im_context, NULL);
+    }
+
+    servo_gtk_web_view_parent_widget_class()->unrealize(widget);
+}
+
 void
 servo_gtk_web_view_class_init_toolkit(ServoGtkWebViewClass *klass)
 {
@@ -564,6 +609,8 @@ servo_gtk_web_view_class_init_toolkit(ServoGtkWebViewClass *klass)
     widget_class->key_press_event = servo_gtk_web_view_key_press;
     widget_class->key_release_event = servo_gtk_web_view_key_release;
     widget_class->touch_event = servo_gtk_web_view_touch_event;
+    widget_class->realize = servo_gtk_web_view_realize;
+    widget_class->unrealize = servo_gtk_web_view_unrealize;
 }
 
 void
@@ -572,6 +619,9 @@ servo_gtk_web_view_init_toolkit(ServoGtkWebView *self)
     GtkWidget *widget = GTK_WIDGET(self);
 
     gtk_widget_set_can_focus(widget, TRUE);
+
+    /* The client window is set once the widget is realized (see ::realize). */
+    servo_gtk_web_view_init_input_method(self);
 
     /* GTK3 only delivers the events the widget has asked for. */
     gtk_widget_add_events(

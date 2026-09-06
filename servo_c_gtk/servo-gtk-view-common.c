@@ -50,6 +50,17 @@ static void servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
                                             ServoWebViewHandle *handle,
                                             gint                scale);
 
+/* Input-method callbacks, registered by attach_servo but defined further down. */
+static void servo_gtk_web_view_on_input_method(bool        multiline,
+                                               const char *text,
+                                               gint32      insertion_point,
+                                               gint32      x,
+                                               gint32      y,
+                                               gint32      width,
+                                               gint32      height,
+                                               gpointer    user_data);
+static void servo_gtk_web_view_on_input_method_hidden(gpointer user_data);
+
 /*
  * The parent class, so the GTK3 source can chain up from size_allocate:
  * G_DEFINE_TYPE puts servo_gtk_web_view_parent_class in this translation unit.
@@ -736,6 +747,7 @@ servo_gtk_web_view_finalize(GObject *object)
     g_clear_pointer(&self->priv->title, g_free);
     g_clear_pointer(&self->priv->dialogs, g_hash_table_unref);
     g_clear_pointer(&self->priv->touch_sequences, g_hash_table_unref);
+    g_clear_object(&self->priv->im_context);
     g_clear_pointer(&self->priv, g_free);
 
     G_OBJECT_CLASS(servo_gtk_web_view_parent_class)->finalize(object);
@@ -780,6 +792,10 @@ servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
         handle, servo_gtk_web_view_on_create_webview, self);
     servo_webview_set_closed_callback(
         handle, servo_gtk_web_view_on_closed, self);
+    servo_webview_set_input_method_callback(
+        handle, servo_gtk_web_view_on_input_method, self);
+    servo_webview_set_input_method_hidden_callback(
+        handle, servo_gtk_web_view_on_input_method_hidden, self);
     servo_webview_set_request_cancelled_callback(
         handle, servo_gtk_web_view_on_request_cancelled, self);
 }
@@ -839,6 +855,174 @@ servo_gtk_web_view_on_scale_factor_changed(GObject    *object,
 
     servo_gtk_web_view_sync_surface(
         self, SERVO_GTK_WIDGET_WIDTH(widget), SERVO_GTK_WIDGET_HEIGHT(widget));
+}
+
+/* ------------------------------------------------------------------ *
+ * Input method
+ *
+ * Keys are fed through a GtkIMContext so that dead keys, compose sequences and
+ * CJK conversion work. GTK reports the in-progress text as preedit and the
+ * finished text as a commit; Servo wants composition start/update/end.
+ *
+ * Only a commit that arrives while a composition is open is forwarded. Outside
+ * one, plain typing reaches Servo as a key event that already carries the
+ * character, and forwarding the commit as well would insert it twice.
+ * ------------------------------------------------------------------ */
+
+static void
+servo_gtk_web_view_on_preedit_start(GtkIMContext *context, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    (void) context;
+
+    if (self->servo == NULL) {
+        return;
+    }
+
+    self->priv->composing = TRUE;
+    servo_webview_composition(self->servo, SERVO_COMPOSITION_START, "");
+}
+
+static void
+servo_gtk_web_view_on_preedit_changed(GtkIMContext *context, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    gchar           *preedit = NULL;
+
+    if (self->servo == NULL) {
+        return;
+    }
+
+    gtk_im_context_get_preedit_string(context, &preedit, NULL, NULL);
+
+    /* Some input methods change the preedit without a ::preedit-start first. */
+    if (!self->priv->composing) {
+        self->priv->composing = TRUE;
+        servo_webview_composition(self->servo, SERVO_COMPOSITION_START, "");
+    }
+
+    servo_webview_composition(self->servo, SERVO_COMPOSITION_UPDATE,
+                              preedit != NULL ? preedit : "");
+
+    g_free(preedit);
+}
+
+static void
+servo_gtk_web_view_on_preedit_end(GtkIMContext *context, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    (void) context;
+
+    if (self->servo == NULL || !self->priv->composing) {
+        return;
+    }
+
+    /*
+     * A commit clears `composing` before this runs, so reaching here still
+     * composing means the composition was abandoned: end it with no text so the
+     * page does not keep showing preedit.
+     */
+    self->priv->composing = FALSE;
+    servo_webview_composition(self->servo, SERVO_COMPOSITION_END, "");
+}
+
+static void
+servo_gtk_web_view_on_commit(GtkIMContext *context, const gchar *text, gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    (void) context;
+
+    /*
+     * Outside a composition the key event already carries this character, so
+     * committing it too would type it twice.
+     */
+    if (self->servo == NULL || !self->priv->composing) {
+        return;
+    }
+
+    self->priv->composing = FALSE;
+    servo_webview_composition(self->servo, SERVO_COMPOSITION_END,
+                              text != NULL ? text : "");
+}
+
+/*
+ * Servo focused an editable field. Point the input method at it so that any
+ * window it shows lands next to the caret rather than in a corner.
+ */
+static void
+servo_gtk_web_view_on_input_method(bool        multiline,
+                                   const char *text,
+                                   gint32      insertion_point,
+                                   gint32      x,
+                                   gint32      y,
+                                   gint32      width,
+                                   gint32      height,
+                                   gpointer    user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+    GdkRectangle     area;
+    gint             scale;
+
+    (void) multiline;
+    (void) text;
+    (void) insertion_point;
+
+    if (self->priv->im_context == NULL) {
+        return;
+    }
+
+    /* Servo reports the field in device pixels; GTK wants widget coordinates. */
+    scale = MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(self)));
+    area.x = x / scale;
+    area.y = y / scale;
+    area.width = width / scale;
+    area.height = height / scale;
+
+    gtk_im_context_set_cursor_location(self->priv->im_context, &area);
+    gtk_im_context_focus_in(self->priv->im_context);
+}
+
+/* Focus left the editable field. */
+static void
+servo_gtk_web_view_on_input_method_hidden(gpointer user_data)
+{
+    ServoGtkWebView *self = SERVO_GTK_WEB_VIEW(user_data);
+
+    if (self->priv->im_context == NULL) {
+        return;
+    }
+
+    /* Abandon anything half-composed rather than leaving it on screen. */
+    if (self->priv->composing) {
+        self->priv->composing = FALSE;
+        if (self->servo != NULL) {
+            servo_webview_ime_dismissed(self->servo);
+        }
+    }
+
+    gtk_im_context_focus_out(self->priv->im_context);
+}
+
+void
+servo_gtk_web_view_init_input_method(ServoGtkWebView *self)
+{
+    /*
+     * A multicontext picks whichever input method the user has configured,
+     * rather than hard-coding the simple one.
+     */
+    self->priv->im_context = gtk_im_multicontext_new();
+
+    g_signal_connect(self->priv->im_context, "preedit-start",
+                     G_CALLBACK(servo_gtk_web_view_on_preedit_start), self);
+    g_signal_connect(self->priv->im_context, "preedit-changed",
+                     G_CALLBACK(servo_gtk_web_view_on_preedit_changed), self);
+    g_signal_connect(self->priv->im_context, "preedit-end",
+                     G_CALLBACK(servo_gtk_web_view_on_preedit_end), self);
+    g_signal_connect(self->priv->im_context, "commit",
+                     G_CALLBACK(servo_gtk_web_view_on_commit), self);
 }
 
 /*

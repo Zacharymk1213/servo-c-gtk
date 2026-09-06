@@ -747,7 +747,17 @@ servo_gtk_web_view_init_toolkit(ServoGtkWebView *self)
     g_signal_connect(scroll, "scroll", G_CALLBACK(servo_gtk_web_view_on_scroll), self);
     gtk_widget_add_controller(widget, scroll);
 
+    servo_gtk_web_view_init_input_method(self);
+    SERVO_GTK_IM_SET_CLIENT(self->priv->im_context, widget);
+
     GtkEventController *key = gtk_event_controller_key_new();
+    /*
+     * Handing the controller the input method makes it filter keys through it
+     * first, so only what the input method does not consume reaches the
+     * handlers below and the rest arrives as preedit and commit.
+     */
+    gtk_event_controller_key_set_im_context(GTK_EVENT_CONTROLLER_KEY(key),
+                                            self->priv->im_context);
     g_signal_connect(key, "key-pressed", G_CALLBACK(servo_gtk_web_view_on_key_pressed), self);
     g_signal_connect(key, "key-released", G_CALLBACK(servo_gtk_web_view_on_key_released), self);
     gtk_widget_add_controller(widget, key);
