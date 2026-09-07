@@ -773,6 +773,8 @@ servo_gtk_web_view_finalize(GObject *object)
     g_clear_pointer(&self->priv->touch_sequences, g_hash_table_unref);
     g_clear_object(&self->priv->im_context);
     g_clear_pointer(&self->priv->script_message_handlers, g_hash_table_unref);
+    g_clear_pointer(&self->priv->pending_html, g_free);
+    g_clear_pointer(&self->priv->pending_user_scripts, g_ptr_array_unref);
     g_clear_pointer(&self->priv, g_free);
 
     G_OBJECT_CLASS(servo_gtk_web_view_parent_class)->finalize(object);
@@ -825,6 +827,24 @@ servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
         handle, servo_gtk_web_view_on_input_method_hidden, self);
     servo_webview_set_request_cancelled_callback(
         handle, servo_gtk_web_view_on_request_cancelled, self);
+
+    /*
+     * Replay whatever was handed over before there was a webview to hand it to.
+     * Scripts first: Servo applies user scripts as a page loads, so one added
+     * after the document would not run in it.
+     */
+    if (self->priv->pending_user_scripts != NULL) {
+        for (guint i = 0; i < self->priv->pending_user_scripts->len; i++) {
+            servo_webview_add_user_script(
+                handle, g_ptr_array_index(self->priv->pending_user_scripts, i));
+        }
+        g_clear_pointer(&self->priv->pending_user_scripts, g_ptr_array_unref);
+    }
+
+    if (self->priv->pending_html != NULL) {
+        servo_webview_load_html(handle, self->priv->pending_html, NULL);
+        g_clear_pointer(&self->priv->pending_html, g_free);
+    }
 }
 
 /*
@@ -1303,6 +1323,9 @@ servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri)
     g_free(self->uri);
     self->uri = g_strdup(uri);
 
+    /* Whichever load came last wins. */
+    g_clear_pointer(&self->priv->pending_html, g_free);
+
     /* If Servo is already up, load now; otherwise allocation picks it up. */
     if (self->servo != NULL && self->uri != NULL) {
         servo_webview_load_uri(self->servo, self->uri);
@@ -1320,15 +1343,20 @@ servo_gtk_web_view_load_html(ServoGtkWebView *self,
     g_return_if_fail(html != NULL);
 
     /*
-     * Unlike load_uri there is nothing to cache for later: a document only
-     * exists once there is a webview to put it in.
+     * Before the widget is allocated there is no webview to load into, so the
+     * document waits here — an application sets its content up immediately
+     * after construction, long before first allocation. A later load replaces
+     * an earlier one, as it would if Servo were already up.
      */
     if (self->servo == NULL) {
-        g_warning("servo_gtk_web_view_load_html() before the web view was "
-                  "allocated; the document was dropped");
+        g_free(self->priv->pending_html);
+        self->priv->pending_html = g_strdup(html);
+        /* Whichever load came last wins. */
+        g_clear_pointer(&self->uri, g_free);
         return;
     }
 
+    g_clear_pointer(&self->priv->pending_html, g_free);
     servo_webview_load_html(self->servo, html, base_uri);
 }
 
@@ -1339,8 +1367,10 @@ servo_gtk_web_view_add_user_script(ServoGtkWebView *self, const gchar *source)
     g_return_if_fail(source != NULL);
 
     if (self->servo == NULL) {
-        g_warning("servo_gtk_web_view_add_user_script() before the web view was "
-                  "allocated; the script was dropped");
+        if (self->priv->pending_user_scripts == NULL) {
+            self->priv->pending_user_scripts = g_ptr_array_new_with_free_func(g_free);
+        }
+        g_ptr_array_add(self->priv->pending_user_scripts, g_strdup(source));
         return;
     }
 

@@ -7,5 +7,17 @@ Name: @PC_LIB@
 Description: Servo web view widget for GTK@PC_MAJOR@
 Version: @SERVO_VERSION@
 Requires: @PC_GTK_PKG@
-Libs: -L${libdir} -l@PC_LIB@
+# libservoshell is listed even though consumers never call it directly. It bakes
+# in a copy of jemalloc whose load-time constructor calls secure_getenv, which
+# resolves to a mozglue interposer inside the same library that looks the real
+# one up with dlsym(RTLD_NEXT). RTLD_NEXT only searches objects loaded *after*
+# the caller, so if libservoshell arrives late — as it does when it is pulled in
+# only transitively, behind an executable that already links libc — the lookup
+# returns NULL and the constructor jumps through it. Naming it here makes it a
+# direct DT_NEEDED of every consumer, which puts it ahead of libc where the
+# lookup succeeds.
+# --no-as-needed because a consumer calls nothing in libservoshell directly, so
+# the linker would otherwise drop it right back out of DT_NEEDED. push-state
+# keeps the surrounding --as-needed setting untouched for everything else.
+Libs: -L${libdir} -l@PC_LIB@ -Wl,--push-state,--no-as-needed -lservoshell -Wl,--pop-state
 Cflags: -I${includedir}/@PC_LIB@

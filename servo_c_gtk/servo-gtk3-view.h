@@ -194,6 +194,10 @@ void servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri);
  * `data:` URL. Its base URL is therefore that `data:` URL rather than
  * @base_uri, so relative links and subresource references in @html will not
  * resolve against @base_uri. @base_uri is accepted and currently unused.
+ *
+ * Safe to call before the widget has been allocated: the document is held and
+ * loaded once the web view exists. A later load, by either this or
+ * servo_gtk_web_view_load_uri(), replaces it.
  */
 void servo_gtk_web_view_load_html(ServoGtkWebView *self,
                                   const gchar     *html,
@@ -208,6 +212,9 @@ void servo_gtk_web_view_load_html(ServoGtkWebView *self,
  *
  * Scripts are applied as a page loads, so one added while a page is already
  * showing first runs on the next load.
+ *
+ * Safe to call before the widget has been allocated: scripts are held and
+ * registered, in order, once the web view exists.
  */
 void servo_gtk_web_view_add_user_script(ServoGtkWebView *self,
                                         const gchar     *source);
