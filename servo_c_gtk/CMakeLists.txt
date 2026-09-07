@@ -110,12 +110,21 @@ if(WIN32)
         set(SERVO_IMPLIB ${SERVO_OUTPUT_DIR}/libservoshell.dll.a)
     endif()
 
+    # cargo-xwin supplies the MSVC toolchain when cross-compiling from Linux. A
+    # native MSYS2/MinGW build targets the GNU ABI with its own toolchain
+    # already present, where xwin has nothing to add and does not apply.
+    if(CARGO_TARGET_TRIPLE MATCHES "msvc")
+        set(CARGO_DRIVER xwin build)
+    else()
+        set(CARGO_DRIVER build)
+    endif()
+
     add_custom_command(
             OUTPUT ${CARGO_OUTPUT} ${SERVO_IMPLIB}
-            COMMAND ${RUSTUP_EXECUTABLE} run nightly cargo xwin build ${CARGO_BUILD_FLAGS} ${CARGO_TARGET_FLAGS}
+            COMMAND ${RUSTUP_EXECUTABLE} run nightly cargo ${CARGO_DRIVER} ${CARGO_BUILD_FLAGS} ${CARGO_TARGET_FLAGS}
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS ${CARGO_DEPENDS}
-            COMMENT "Building Rust Servo wrapper (cargo build ${CARGO_BUILD_FLAGS} ${CARGO_TARGET_FLAGS})"
+            COMMENT "Building Rust Servo wrapper (cargo ${CARGO_DRIVER} ${CARGO_BUILD_FLAGS} ${CARGO_TARGET_FLAGS})"
             VERBATIM
     )
 
