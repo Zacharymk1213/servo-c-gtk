@@ -439,6 +439,17 @@ void servo_webview_load_uri(ServoWebViewHandle *webview, const char *uri);
 void servo_webview_load_html(ServoWebViewHandle *webview,
                              const char         *html,
                              const char         *base_uri);
+
+/*
+ * Turn `html` into the data: URL that would load it, as a newly-allocated
+ * string (free with servo_string_free()), or NULL on failure.
+ *
+ * Separate from servo_webview_load_html() because a document supplied before
+ * the webview exists has to be handed to servo_webview_new() as its initial
+ * URL: Servo creates the browsing context together with that URL, and a load
+ * issued before the context exists is silently dropped.
+ */
+char *servo_webview_html_to_data_uri(const char *html);
 void servo_webview_reload(ServoWebViewHandle *webview);
 void servo_webview_go_back(ServoWebViewHandle *webview);
 void servo_webview_go_forward(ServoWebViewHandle *webview);

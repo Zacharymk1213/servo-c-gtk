@@ -216,6 +216,11 @@ void servo_webview_add_user_script(ServoWebViewHandle *webview, const char *sour
     (void) webview; (void) source;
 }
 
+char *servo_webview_html_to_data_uri(const char *html)
+{
+    (void) html; return NULL;
+}
+
 void servo_webview_reload(ServoWebViewHandle *webview) { (void) webview; }
 void servo_webview_go_back(ServoWebViewHandle *webview) { (void) webview; }
 void servo_webview_go_forward(ServoWebViewHandle *webview) { (void) webview; }

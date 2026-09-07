@@ -773,7 +773,6 @@ servo_gtk_web_view_finalize(GObject *object)
     g_clear_pointer(&self->priv->touch_sequences, g_hash_table_unref);
     g_clear_object(&self->priv->im_context);
     g_clear_pointer(&self->priv->script_message_handlers, g_hash_table_unref);
-    g_clear_pointer(&self->priv->pending_html, g_free);
     g_clear_pointer(&self->priv->pending_user_scripts, g_ptr_array_unref);
     g_clear_pointer(&self->priv, g_free);
 
@@ -841,10 +840,6 @@ servo_gtk_web_view_attach_servo(ServoGtkWebView    *self,
         g_clear_pointer(&self->priv->pending_user_scripts, g_ptr_array_unref);
     }
 
-    if (self->priv->pending_html != NULL) {
-        servo_webview_load_html(handle, self->priv->pending_html, NULL);
-        g_clear_pointer(&self->priv->pending_html, g_free);
-    }
 }
 
 /*
@@ -1323,9 +1318,6 @@ servo_gtk_web_view_load_uri(ServoGtkWebView *self, const gchar *uri)
     g_free(self->uri);
     self->uri = g_strdup(uri);
 
-    /* Whichever load came last wins. */
-    g_clear_pointer(&self->priv->pending_html, g_free);
-
     /* If Servo is already up, load now; otherwise allocation picks it up. */
     if (self->servo != NULL && self->uri != NULL) {
         servo_webview_load_uri(self->servo, self->uri);
@@ -1342,22 +1334,36 @@ servo_gtk_web_view_load_html(ServoGtkWebView *self,
     g_return_if_fail(SERVO_GTK_IS_WEB_VIEW(self));
     g_return_if_fail(html != NULL);
 
-    /*
-     * Before the widget is allocated there is no webview to load into, so the
-     * document waits here — an application sets its content up immediately
-     * after construction, long before first allocation. A later load replaces
-     * an earlier one, as it would if Servo were already up.
-     */
-    if (self->servo == NULL) {
-        g_free(self->priv->pending_html);
-        self->priv->pending_html = g_strdup(html);
-        /* Whichever load came last wins. */
-        g_clear_pointer(&self->uri, g_free);
-        return;
-    }
+    (void) base_uri;
 
-    g_clear_pointer(&self->priv->pending_html, g_free);
-    servo_webview_load_html(self->servo, html, base_uri);
+    /*
+     * Routed through load_uri rather than loaded directly, even when the
+     * webview already exists.
+     *
+     * Servo creates a webview's browsing context together with the URL it is
+     * built with, and a load issued before that context exists is dropped on
+     * the floor — which is exactly the case here, since an application sets its
+     * content up immediately after construction and long before GTK first
+     * allocates the widget. Handing the document over as the data: URL the
+     * webview is created with puts it on the one path that works, and reuses
+     * the caching load_uri already does.
+     */
+    {
+        /*
+         * Allocated by the Rust side, so it has to go back there to be freed:
+         * libservoshell has its own allocator and g_free() on this would abort.
+         */
+        char *data_uri = servo_webview_html_to_data_uri(html);
+
+        if (data_uri == NULL) {
+            g_warning("servo_gtk_web_view_load_html(): the document could not be "
+                      "encoded as a URL");
+            return;
+        }
+
+        servo_gtk_web_view_load_uri(self, data_uri);
+        servo_string_free(data_uri);
+    }
 }
 
 void

@@ -1922,6 +1922,51 @@ pub unsafe extern "C" fn servo_webview_load_uri(
     }
 }
 
+/// Turn `html` into the `data:` URL that would load it, as a newly-allocated C
+/// string, or NULL if `html` is NULL or not valid UTF-8. Free the result with
+/// [`servo_string_free`].
+///
+/// Exposed separately from [`servo_webview_load_html`] because a document
+/// supplied before the webview exists has to be handed to
+/// [`servo_webview_new`] as its initial URL: Servo creates the browsing context
+/// together with that URL, and a load issued before the context exists is
+/// silently dropped.
+///
+/// # Safety
+/// `html` must be NULL or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn servo_webview_html_to_data_uri(html: *const c_char) -> *mut c_char {
+    if html.is_null() {
+        return ptr::null_mut();
+    }
+    let Ok(html) = (unsafe { CStr::from_ptr(html) }).to_str() else {
+        return ptr::null_mut();
+    };
+
+    match CString::new(html_data_uri(html)) {
+        Ok(uri) => uri.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Build the `data:` URL for an HTML document.
+///
+/// Everything outside the unreserved set is percent-encoded, so a document
+/// containing `#`, `%`, `&` or non-ASCII text survives being read back as a
+/// URL. Base64 would be shorter but needs a dependency to encode.
+fn html_data_uri(html: &str) -> String {
+    let mut encoded = String::with_capacity(html.len() * 3);
+    for byte in html.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            },
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    format!("data:text/html;charset=utf-8,{encoded}")
+}
+
 /// Load `html` as a document, as if it had been fetched from `base_uri`.
 ///
 /// Servo can only be told to load a URL, so the document is handed over as a
@@ -1953,20 +1998,7 @@ pub unsafe extern "C" fn servo_webview_load_html(
         return;
     };
 
-    // Percent-encode everything outside the unreserved set, so that a document
-    // containing `#`, `%`, `&` or non-ASCII text survives being read back as a
-    // URL. Base64 would be shorter but needs a dependency to encode.
-    let mut encoded = String::with_capacity(html.len() * 3);
-    for byte in html.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*byte as char)
-            },
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-
-    let Ok(url) = Url::parse(&format!("data:text/html;charset=utf-8,{encoded}")) else {
+    let Ok(url) = Url::parse(&html_data_uri(html)) else {
         return;
     };
 

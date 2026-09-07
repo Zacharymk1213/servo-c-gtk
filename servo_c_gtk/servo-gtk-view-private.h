@@ -104,11 +104,11 @@ struct _ServoGtkWebViewPrivate {
      */
     GHashTable   *script_message_handlers;
     /*
-     * A document and user scripts handed over before the widget was allocated,
-     * replayed once the Servo webview exists. An application sets these up
-     * immediately after construction, which is well before first allocation.
+     * User scripts handed over before the widget was allocated, registered once
+     * the Servo webview exists. An application sets these up immediately after
+     * construction, which is well before first allocation. (A document supplied
+     * that early rides on the "uri" property instead, as a data: URL.)
      */
-    gchar        *pending_html;
     GPtrArray    *pending_user_scripts;
     /*
      * Whether a composition is open. Only a commit that arrives during one is
