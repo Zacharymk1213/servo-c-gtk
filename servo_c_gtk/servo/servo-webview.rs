@@ -1007,6 +1007,38 @@ pub struct ServoWebViewHandle {
     _rendering_context: Rc<SoftwareRenderingContext>,
 }
 
+thread_local! {
+    /// The one Servo engine this process gets.
+    ///
+    /// `ServoBuilder::build()` initialises Servo's process-global options, and
+    /// doing that a second time panics with "Already initialized" — so an
+    /// engine per webview only works until an application opens a second one.
+    /// Every webview is therefore built from this shared engine, which is
+    /// exactly the shape Servo expects: one `Servo`, many `WebView`s.
+    ///
+    /// It lives in thread-local storage because `Servo` is `Rc`-based and not
+    /// `Send`; every entry point here is already documented as belonging to the
+    /// one thread that created the handle.
+    ///
+    /// Never cleared. Servo cannot be re-initialised in the same process, so
+    /// dropping the last webview must not take the engine down with it.
+    static SERVO: RefCell<Option<Servo>> = const { RefCell::new(None) };
+}
+
+/// The shared engine, built on first use.
+fn shared_servo() -> Servo {
+    SERVO.with(|servo| {
+        servo
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                ServoBuilder::default()
+                    .preferences(experimental_preferences())
+                    .build()
+            })
+            .clone()
+    })
+}
+
 static INIT: Once = Once::new();
 
 /// One-time, process-global initialisation of the TLS crypto provider. Safe to
@@ -1176,9 +1208,7 @@ pub unsafe extern "C" fn servo_webview_new(
             .and_then(|s| Url::parse(s).ok())
     };
 
-    let servo = ServoBuilder::default()
-        .preferences(experimental_preferences())
-        .build();
+    let servo = shared_servo();
 
     let delegate = Rc::new(EmbedderDelegate::new(rendering_context.clone()));
     let user_content = UserContentManager::new(&servo);
