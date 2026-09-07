@@ -51,9 +51,10 @@ PAC=(
   mingw-w64-ucrt-x86_64-gtk4
   mingw-w64-ucrt-x86_64-gtksourceview5
   mingw-w64-ucrt-x86_64-libadwaita
+  mingw-w64-ucrt-x86_64-libspelling
   mingw-w64-ucrt-x86_64-json-glib
   mingw-w64-ucrt-x86_64-gobject-introspection
-  mingw-w64-ucrt-x86_64-rust
+  mingw-w64-ucrt-x86_64-rustup
   mingw-w64-ucrt-x86_64-angleproject
   mingw-w64-ucrt-x86_64-nodejs
   git
@@ -73,21 +74,17 @@ for tool in gcc cmake ninja meson pkg-config; do
 done
 [ ${#missing[@]} -eq 0 ] || die "missing tools: ${missing[*]} — run with --install-deps"
 
-# libspelling is not in MSYS2; djoter needs it, so it is built from source here
-# unless it is already present.
-if ! pkg-config --exists libspelling-1; then
-  warn "libspelling-1 not found in the MSYS2 repositories."
-  warn "djoter depends on it. Build it from https://gitlab.gnome.org/GNOME/libspelling"
-  warn "into the same prefix, or drop the dependency from djoter/meson.build."
-fi
+pkgs=(gtk4 gtksourceview-5 libadwaita-1 libspelling-1 json-glib-1.0)
+missing=()
+for p in "${pkgs[@]}"; do
+  pkg-config --exists "$p" || missing+=("$p")
+done
+[ ${#missing[@]} -eq 0 ] || die "missing development packages: ${missing[*]} — run with --install-deps"
 
 # servo-gtk's CMake calls `rustup run nightly cargo`, and the pinned
 # -Ztls-model=global-dynamic needs nightly.
-command -v rustup >/dev/null 2>&1 || die "rustup not found.
-MSYS2's mingw-w64-ucrt-x86_64-rust ships a stable rustc but no rustup, and the
-build needs a nightly toolchain driven through rustup. Install the Windows
-rustup (https://rustup.rs) and make sure it is on PATH inside this shell, or
-add it with:  pacman -S mingw-w64-ucrt-x86_64-rustup"
+command -v rustup >/dev/null 2>&1 || die "rustup not found — run with --install-deps,
+or:  pacman -S mingw-w64-ucrt-x86_64-rustup"
 
 if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
   say "Installing the Rust nightly toolchain (GNU ABI)"

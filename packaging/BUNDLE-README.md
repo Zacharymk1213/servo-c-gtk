@@ -54,14 +54,9 @@ pins `-Ztls-model=global-dynamic`, so it needs a nightly toolchain, and its
 CMake invokes `rustup run nightly cargo` directly. The scripts install the
 nightly toolchain for you if rustup is present.
 
-**MSYS2** — the `--install-deps` flag runs the pacman line. Two things are not
-in the MSYS2 repositories and are called out by the script if missing:
-
-- **libspelling**, which djoter depends on. Build it from source into the same
-  prefix, or drop the dependency from `djoter/meson.build`.
-- **rustup**, if your MSYS2 has no `mingw-w64-ucrt-x86_64-rustup`. Install the
-  Windows rustup from <https://rustup.rs> and make sure it is on `PATH` inside
-  the UCRT64 shell.
+**MSYS2** — everything needed is packaged for UCRT64, including `libspelling`,
+`rustup` and `angleproject`. The `--install-deps` flag runs the pacman line;
+without it the line is printed for you to run yourself.
 
 ## Windows notes
 
@@ -90,6 +85,10 @@ switches on for documents GtkSourceView recognises as djot — `*.dj`, `*.djot`,
 ## Status
 
 The Linux path is the one that has actually been run: it builds, installs, and
-renders djot through Servo. **The MSYS2 path has not been executed** — it is
-written from the repository's existing Windows support and the MSYS2 package
-names, and should be treated as a starting point rather than a tested recipe.
+renders djot through Servo.
+
+**The MSYS2 path has not been executed** — there was no Windows machine to run
+it on. Every package name in it has been checked against the MSYS2 repositories,
+and the ABI and ANGLE handling follow the repository's existing Windows support,
+but treat the first run as a shakedown rather than a tested recipe. The most
+likely rough edges are Servo's own Windows build and the ANGLE staging.
